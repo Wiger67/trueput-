@@ -1230,8 +1230,10 @@ name = "trueput"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "bytes",
  "clap",
  "futures-util",
+ "http-body",
  "reqwest",
  "rustls",
  "serde",

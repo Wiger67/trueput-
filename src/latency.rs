@@ -48,6 +48,7 @@ pub struct Probe {
     pub phase: Phase,
 }
 
+#[derive(Debug)]
 pub struct Prober {
     addr: SocketAddr,
     timeout: Duration,

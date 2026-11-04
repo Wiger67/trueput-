@@ -12,6 +12,9 @@
 //!
 //! 鎖定之後才開始收正式的統計樣本（見 [`crate::engine`]），
 //! 這樣新連線慢啟動造成的低估不會混進結果。
+//!
+//! 評估窗格的長度會依閒置延遲調整（[`window_for_rtt`]）：TCP 慢啟動要花
+//! 好幾個 RTT 才能把速度拉起來，高延遲路徑上 1 秒可能還看不出加連線的效果。
 
 use std::time::Duration;
 
@@ -35,6 +38,22 @@ impl Default for AutoConfig {
             window: Duration::from_secs(1),
             growth_threshold: 0.10,
         }
+    }
+}
+
+/// 評估窗格至少要涵蓋幾個 RTT
+const WINDOW_RTTS: u32 = 10;
+/// 評估窗格的上限，避免測試時間都花在調整上
+const MAX_WINDOW: Duration = Duration::from_secs(3);
+
+/// 依閒置 RTT 決定評估窗格：`max(base, 10 × RTT)`，上限 3 秒。
+///
+/// 例如 1 Gbps、RTT 200ms 的路徑，BDP 約 25 MB；慢啟動從 ~15 KB 加倍到 25 MB
+/// 約需 11 個 RTT（2.2 秒），固定 1 秒的窗格會在新連線還沒跑起來前就判定「沒幫助」。
+pub fn window_for_rtt(base: Duration, idle_rtt: Option<Duration>) -> Duration {
+    match idle_rtt {
+        Some(rtt) => (rtt * WINDOW_RTTS).clamp(base, MAX_WINDOW.max(base)),
+        None => base,
     }
 }
 
@@ -134,6 +153,24 @@ mod tests {
         assert_eq!(s.observe(200.0, 4), Some(6));
         assert_eq!(s.observe(300.0, 6), None);
         assert!(s.locked());
+    }
+
+    #[test]
+    fn window_scales_with_rtt() {
+        let base = Duration::from_secs(1);
+        assert_eq!(window_for_rtt(base, None), base);
+        // 低延遲：維持基本值
+        assert_eq!(window_for_rtt(base, Some(Duration::from_millis(15))), base);
+        // 200ms → 2 秒
+        assert_eq!(
+            window_for_rtt(base, Some(Duration::from_millis(200))),
+            Duration::from_secs(2)
+        );
+        // 很高的延遲：上限 3 秒
+        assert_eq!(
+            window_for_rtt(base, Some(Duration::from_millis(800))),
+            Duration::from_secs(3)
+        );
     }
 
     #[test]
