@@ -6,9 +6,10 @@
 
 ```bash
 cargo build --release
-./target/release/trueput                 # 預設：Cloudflare，8 條連線，15 秒
+./target/release/trueput                 # 預設：Cloudflare，自動調整連線數，15 秒
 ./target/release/trueput -b ndt7         # M-Lab ndt7
-./target/release/trueput -c 16 -d 20     # 16 條連線、測 20 秒
+./target/release/trueput -c 4 -d 20      # 固定 4 條連線、測 20 秒
+./target/release/trueput --max-connections 32  # 自動模式最多開到 32 條
 ./target/release/trueput --json          # JSON 輸出（含所有樣本）
 ./target/release/trueput --no-latency    # 不量延遲
 ```
@@ -19,7 +20,7 @@ cargo build --release
 下載速度：940.6 Mbps（中位數）
   範圍 P10–P90：806.9 – 962.2 Mbps，最高 967.4 Mbps
   暖機後平均：909.3 Mbps（21 個樣本）
-  連線數 4，總時長 6.0s（暖機 2.0s），共收到 684.9 MB
+  連線數 8（自動：2 → 4 → 8），總時長 15.0s（暖機 3.0s），共收到 1705.2 MB
 
 延遲（TCP 交握，104.16.x.x:443）：
   閒置      12.3 ms（最低 11.8，P90 13.0，抖動 0.5 ms）
@@ -31,11 +32,22 @@ cargo build --release
 
 所有後端共用同一套方法（`src/engine.rs`），結果可以直接互相比較：
 
-1. 開 N 條平行串流（避免單條 TCP 被視窗大小限制），收到資料就計數並丟掉，不寫入硬碟。
+1. 開多條平行串流（避免單條 TCP 被視窗大小限制），收到資料就計數並丟掉，不寫入硬碟。連線數預設自動調整，見下方。
 2. 每 200ms 取樣一次，用「該段位元組數 ÷ 實際經過時間」計算速度。
-3. 前 3 秒視為暖機（TCP 慢啟動），不列入統計。
+3. 暖機期間（TCP 慢啟動、連線數調整中）的樣本不列入統計。暖機要「至少 3 秒」**而且**「連線數已鎖定」才結束。
 4. 報告**中位數**、P10–P90 範圍，以及暖機後的整體平均。
 5. 數值是應用層 goodput，不含 TCP/IP/TLS 標頭，約比線路速度低 3–6%。
+
+### 動態調整連線數
+
+單一條連線常被 TCP 視窗、伺服器限速或路徑設備卡住，跑不滿頻寬；但連線開太多也是浪費。做法（`src/autoscale.rs`）：
+
+1. 從 2 條開始，每 1 秒評估一次。
+2. 第一次評估直接把連線數加倍試試看；之後只要速度比上一秒高 **10% 以上**，就繼續加倍（2 → 4 → 8 → 16）。
+3. 速度沒有明顯成長，或到達上限（`--max-connections`，預設 16），就鎖定連線數。
+4. 測試時間過半還沒鎖定，就強制鎖定，確保有足夠的正式樣本。
+
+用 `-c <N>` 可以改成固定連線數；ndt7 依規範固定 1 條。
 
 ### 延遲與 bufferbloat
 
@@ -61,6 +73,7 @@ cargo build --release
 src/
 ├── main.rs            CLI 參數與流程
 ├── engine.rs          測速引擎：平行連線、取樣、暖機
+├── autoscale.rs       動態調整連線數
 ├── latency.rs         延遲量測（TCP 交握）
 ├── stats.rs           中位數、百分位數、單位換算
 ├── report.rs          人類可讀 / JSON 輸出
@@ -74,7 +87,8 @@ src/
 
 - [x] 閒置延遲與負載下延遲（bufferbloat）
 - [ ] ndt7：用伺服器端回報的 TCPInfo RTT 交叉驗證負載下延遲
-- [ ] 動態調整連線數（速度還在上升就加連線）
+- [x] 動態調整連線數
+- [ ] 依閒置延遲調整評估窗格（高延遲路徑的慢啟動較久，1 秒可能不夠）
 - [ ] 速度穩定後提前結束
 - [ ] 上傳測試
 - [ ] 一次測多台伺服器並比較

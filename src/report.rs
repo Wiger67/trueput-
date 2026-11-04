@@ -3,7 +3,7 @@
 use serde::Serialize;
 
 use crate::backend::ServerInfo;
-use crate::engine::{Config, Outcome, Sample};
+use crate::engine::{Config, ConnectionStep, Connections, Outcome, Sample};
 use crate::latency::Probe;
 use crate::stats::{LatencySummary, RttStats, Summary};
 
@@ -11,8 +11,13 @@ use crate::stats::{LatencySummary, RttStats, Summary};
 pub struct Report {
     pub backend: &'static str,
     pub server: ServerInfo,
+    /// "auto" 或 "fixed"
+    pub connection_mode: &'static str,
+    /// 最終連線數
     pub connections: usize,
-    pub warmup_secs: f64,
+    pub connection_steps: Vec<ConnectionStep>,
+    /// 暖機實際結束的時間點（秒）
+    pub warmup_secs: Option<f64>,
     pub elapsed_secs: f64,
     pub total_bytes: u64,
     /// 暖機後沒有任何樣本時為 `None`（例如測試提早結束）
@@ -38,8 +43,13 @@ impl Report {
         Self {
             backend,
             server,
+            connection_mode: match cfg.connections {
+                Connections::Auto(_) => "auto",
+                Connections::Fixed(_) => "fixed",
+            },
             connections: out.connections,
-            warmup_secs: cfg.warmup.as_secs_f64(),
+            connection_steps: out.connection_steps.clone(),
+            warmup_secs: out.steady_start_secs,
             elapsed_secs: out.elapsed_secs,
             total_bytes: out.total_bytes,
             summary: Summary::from_samples(&out.steady_samples(), out.steady_avg_mbps()),
@@ -70,11 +80,23 @@ impl Report {
             }
             None => println!("測試太短，暖機結束後沒有任何樣本，請加長測試時間或縮短暖機。"),
         }
+
+        let conn = if self.connection_mode == "auto" {
+            let path: Vec<String> = self
+                .connection_steps
+                .iter()
+                .map(|s| s.connections.to_string())
+                .collect();
+            format!("{}（自動：{}）", self.connections, path.join(" → "))
+        } else {
+            self.connections.to_string()
+        };
+        let warmup = self
+            .warmup_secs
+            .map_or("整場".into(), |w| format!("{w:.1}s"));
         println!(
-            "  連線數 {}，總時長 {:.1}s（暖機 {:.1}s），共收到 {:.1} MB",
-            self.connections,
+            "  連線數 {conn}，總時長 {:.1}s（暖機 {warmup}），共收到 {:.1} MB",
             self.elapsed_secs,
-            self.warmup_secs,
             self.total_bytes as f64 / 1_000_000.0
         );
         println!("  註：數值為應用層 goodput，不含 TCP/IP/TLS 標頭，約比線路速度低 3–6%。");

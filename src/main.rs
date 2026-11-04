@@ -1,3 +1,4 @@
+mod autoscale;
 mod backend;
 mod engine;
 mod latency;
@@ -23,15 +24,19 @@ struct Args {
     #[arg(short, long, value_enum, default_value_t = BackendKind::Cloudflare)]
     backend: BackendKind,
 
-    /// 平行連線數（ndt7 固定為 1）
-    #[arg(short, long, default_value_t = 8, value_parser = clap::value_parser!(u16).range(1..=64))]
-    connections: u16,
+    /// 平行連線數：`auto` 自動調整，或指定 1～64 的固定值（ndt7 固定為 1）
+    #[arg(short, long, default_value = "auto", value_parser = parse_connections)]
+    connections: ConnArg,
+
+    /// 自動模式的連線數上限
+    #[arg(long, default_value_t = 16, value_parser = clap::value_parser!(u16).range(1..=64))]
+    max_connections: u16,
 
     /// 測試總長度上限（秒，含暖機）
     #[arg(short, long, default_value_t = 15.0, value_parser = parse_secs)]
     duration: f64,
 
-    /// 暖機長度（秒），這段期間的樣本不列入統計
+    /// 最短暖機長度（秒），這段期間的樣本不列入統計；自動模式下，連線數穩定前也算暖機
     #[arg(short, long, default_value_t = 3.0, value_parser = parse_secs)]
     warmup: f64,
 
@@ -62,6 +67,22 @@ enum BackendKind {
     Cloudflare,
     /// M-Lab ndt7（WebSocket，單連線，測試長度由伺服器決定）
     Ndt7,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum ConnArg {
+    Auto,
+    Fixed(usize),
+}
+
+fn parse_connections(s: &str) -> Result<ConnArg, String> {
+    if s.eq_ignore_ascii_case("auto") {
+        return Ok(ConnArg::Auto);
+    }
+    match s.parse::<usize>() {
+        Ok(n) if (1..=64).contains(&n) => Ok(ConnArg::Fixed(n)),
+        _ => Err("必須是 auto 或 1～64 的整數".into()),
+    }
 }
 
 fn parse_secs(s: &str) -> Result<f64, String> {
@@ -107,7 +128,13 @@ async fn main() -> anyhow::Result<()> {
     }
 
     let cfg = engine::Config {
-        connections: args.connections.into(),
+        connections: match args.connections {
+            ConnArg::Fixed(n) => engine::Connections::Fixed(n),
+            ConnArg::Auto => engine::Connections::Auto(autoscale::AutoConfig {
+                max: args.max_connections.into(),
+                ..Default::default()
+            }),
+        },
         duration: Duration::from_secs_f64(args.duration),
         warmup: Duration::from_secs_f64(args.warmup),
         interval: Duration::from_millis(args.interval_ms),
@@ -132,7 +159,10 @@ async fn main() -> anyhow::Result<()> {
                 .latest_rtt_ms
                 .map(|r| format!("  {r:7.1} ms"))
                 .unwrap_or_default();
-            eprint!("\r\x1b[2K{:5.1}s  {:9.1} Mbps{rtt}{tag}", s.t_secs, s.mbps);
+            eprint!(
+                "\r\x1b[2K{:5.1}s  {:9.1} Mbps  {:2} 條連線{rtt}{tag}",
+                s.t_secs, s.mbps, s.connections
+            );
             let _ = std::io::stderr().flush();
         }
     })

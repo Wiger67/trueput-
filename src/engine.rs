@@ -2,14 +2,16 @@
 //!
 //! 測量方法：
 //! - （可選）下載前先量閒置延遲。
-//! - 開 N 條平行串流（受後端的 `max_connections` 限制），全部累加到同一個計數器。
+//! - 開平行串流（受後端的 `max_connections` 限制），全部累加到同一個計數器。
+//!   連線數可以固定，或由 [`crate::autoscale`] 動態調整。
 //! - 每隔 `interval` 讀一次計數器，用「這段期間的位元組數 ÷ 實際經過時間」算出一個樣本。
 //!   用實際時間而不是假設的 interval，排程延遲才不會影響結果。
 //! - 下載期間另外有一個 task 持續量延遲（負載下延遲），細節見 [`crate::latency`]。
-//! - 前 `warmup` 秒的樣本標記為暖機（TCP 慢啟動），不列入統計。
+//! - 暖機（TCP 慢啟動、連線數調整中）的樣本不列入統計。暖機要同時滿足兩個條件才結束：
+//!   經過至少 `warmup` 秒，而且連線數已經鎖定。
 //! - 時間到或所有串流都結束就停止。
 
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -17,17 +19,26 @@ use serde::Serialize;
 use tokio::task::JoinSet;
 use tokio::time::{Instant, MissedTickBehavior};
 
+use crate::autoscale::{AutoConfig, Scaler};
 use crate::backend::Backend;
 use crate::latency::{self, Phase, Probe, Prober, to_ms};
 use crate::stats::mbps;
 
 #[derive(Debug, Clone)]
+pub enum Connections {
+    /// 固定連線數
+    Fixed(usize),
+    /// 動態調整
+    Auto(AutoConfig),
+}
+
+#[derive(Debug, Clone)]
 pub struct Config {
-    /// 想要的平行連線數（實際值可能被後端限制）
-    pub connections: usize,
+    /// 平行連線數（實際值會受後端限制）
+    pub connections: Connections,
     /// 測試總長度上限（含暖機）
     pub duration: Duration,
-    /// 暖機長度，這段期間的樣本不列入統計
+    /// 最短暖機長度；自動模式下，連線數鎖定前也算暖機
     pub warmup: Duration,
     /// 取樣間隔
     pub interval: Duration,
@@ -41,9 +52,18 @@ pub struct Sample {
     pub t_secs: f64,
     pub mbps: f64,
     pub warmup: bool,
+    /// 這個樣本期間的連線數
+    pub connections: usize,
     /// 取樣當下最近一次的延遲量測，只用於即時顯示
     #[serde(skip)]
     pub latest_rtt_ms: Option<f64>,
+}
+
+/// 連線數的變化紀錄
+#[derive(Debug, Clone, Serialize)]
+pub struct ConnectionStep {
+    pub t_secs: f64,
+    pub connections: usize,
 }
 
 #[derive(Debug, Default)]
@@ -58,8 +78,12 @@ pub struct LatencyOutcome {
 #[derive(Debug)]
 pub struct Outcome {
     pub samples: Vec<Sample>,
-    /// 實際使用的連線數
+    /// 最終使用的連線數
     pub connections: usize,
+    /// 連線數的變化（第一筆為初始值）
+    pub connection_steps: Vec<ConnectionStep>,
+    /// 暖機實際結束的時間點；`None` 表示整場測試都在暖機
+    pub steady_start_secs: Option<f64>,
     pub total_bytes: u64,
     pub elapsed_secs: f64,
     /// 暖機後收到的位元組數與經過時間
@@ -133,10 +157,19 @@ pub async fn run(
     cfg: &Config,
     mut on_sample: impl FnMut(&Sample),
 ) -> anyhow::Result<Outcome> {
-    let connections = backend
-        .max_connections()
-        .map_or(cfg.connections, |max| cfg.connections.min(max))
-        .max(1);
+    let limit = backend.max_connections().unwrap_or(usize::MAX).max(1);
+    let (mut connections, mut scaler, window) = match &cfg.connections {
+        Connections::Fixed(n) => ((*n).clamp(1, limit), Scaler::fixed(), Duration::MAX),
+        Connections::Auto(a) => {
+            let max = a.max.clamp(1, limit);
+            let start = a.start.clamp(1, max);
+            (
+                start,
+                Scaler::auto(start, max, a.growth_threshold),
+                a.window,
+            )
+        }
+    };
 
     // ── 閒置延遲 ───────────────────────────────────────────
     let (mut latency_out, idle_raw, prober) = match &cfg.latency {
@@ -152,40 +185,49 @@ pub async fn run(
     let mut workers = JoinSet::new();
     let start = Instant::now();
 
-    for _ in 0..connections {
+    let spawn_worker = |workers: &mut JoinSet<anyhow::Result<()>>| {
         let (backend, counter) = (backend.clone(), counter.clone());
         workers.spawn(async move {
             loop {
                 backend.download(counter.clone()).await?;
                 if !backend.restart_streams() {
-                    return anyhow::Ok(());
+                    return Ok(());
                 }
             }
         });
+    };
+    for _ in 0..connections {
+        spawn_worker(&mut workers);
     }
+    let mut connection_steps = vec![ConnectionStep {
+        t_secs: 0.0,
+        connections,
+    }];
+    // 延遲量測 task 用這個旗標判斷目前是暖機還是正式量測
+    let steady = Arc::new(AtomicBool::new(false));
 
     // ── 負載下延遲：與下載同時進行 ─────────────────────────
     // 一次只有一個量測在進行；量測慢的時候不會越積越多。
     let loaded_probes: Arc<Mutex<Vec<Probe>>> = Arc::default();
     let probe_task = match (&cfg.latency, prober) {
         (Some(lc), Some(prober)) => {
-            let (probes, interval, warmup) = (loaded_probes.clone(), lc.interval, cfg.warmup);
+            let (probes, interval, steady) = (loaded_probes.clone(), lc.interval, steady.clone());
             Some(tokio::spawn(async move {
                 let mut tick = tokio::time::interval(interval);
                 tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
                 loop {
                     tick.tick().await;
                     let at = Instant::now();
+                    let phase = if steady.load(Ordering::Relaxed) {
+                        Phase::Loaded
+                    } else {
+                        Phase::Warmup
+                    };
                     let rtt = prober.probe().await;
-                    let t = at - start;
                     probes.lock().unwrap().push(Probe {
-                        t_secs: t.as_secs_f64(),
+                        t_secs: (at - start).as_secs_f64(),
                         rtt_ms: rtt.map(to_ms),
-                        phase: if t <= warmup {
-                            Phase::Warmup
-                        } else {
-                            Phase::Loaded
-                        },
+                        phase,
                     });
                 }
             }))
@@ -202,6 +244,7 @@ pub async fn run(
     let mut stream_errors = Vec::new();
     let (mut last_bytes, mut last_t) = (0u64, start);
     let mut steady_start: Option<(u64, Instant)> = None;
+    let (mut window_bytes, mut window_t) = (0u64, start);
 
     loop {
         tick.tick().await;
@@ -209,18 +252,45 @@ pub async fn run(
         let bytes = counter.load(Ordering::Relaxed);
         let elapsed = now - start;
 
+        // 這個樣本期間的連線數（調整前）
+        let sample_connections = connections;
+
+        // 測試過半還沒穩定就強制鎖定，確保有足夠的正式樣本。
+        // 要在調整之前檢查，避免在正式量測開始的瞬間又加開新連線。
+        if elapsed >= cfg.duration / 2 {
+            scaler.lock();
+        }
+        // ── 連線數調整：每個窗格評估一次 ──
+        if !scaler.locked() && now - window_t >= window {
+            let rate = mbps(bytes - window_bytes, (now - window_t).as_secs_f64());
+            if let Some(target) = scaler.observe(rate, connections) {
+                for _ in connections..target {
+                    spawn_worker(&mut workers);
+                }
+                connections = target;
+                connection_steps.push(ConnectionStep {
+                    t_secs: elapsed.as_secs_f64(),
+                    connections,
+                });
+            }
+            (window_bytes, window_t) = (bytes, now);
+        }
         let sample = Sample {
             t_secs: elapsed.as_secs_f64(),
+            connections: sample_connections,
             mbps: mbps(bytes - last_bytes, (now - last_t).as_secs_f64()),
-            warmup: elapsed <= cfg.warmup,
+            // 鎖定是在這次取樣時才決定的，所以這一段仍然算暖機
+            warmup: steady_start.is_none(),
             latest_rtt_ms: loaded_probes.lock().unwrap().last().and_then(|p| p.rtt_ms),
         };
-        if !sample.warmup && steady_start.is_none() {
-            steady_start = Some((last_bytes, last_t));
-        }
         on_sample(&sample);
         samples.push(sample);
         (last_bytes, last_t) = (bytes, now);
+
+        if steady_start.is_none() && elapsed >= cfg.warmup && scaler.locked() {
+            steady_start = Some((bytes, now));
+            steady.store(true, Ordering::Relaxed);
+        }
 
         while let Some(res) = workers.try_join_next() {
             match res {
@@ -272,6 +342,8 @@ pub async fn run(
     Ok(Outcome {
         samples,
         connections,
+        connection_steps,
+        steady_start_secs: steady_start.map(|(_, t)| (t - start).as_secs_f64()),
         total_bytes,
         elapsed_secs: (last_t - start).as_secs_f64(),
         steady_bytes,
@@ -286,9 +358,12 @@ mod tests {
     use super::*;
     use crate::backend::{BoxFuture, ServerInfo};
 
-    /// 假後端：每 10ms 送出固定位元組數，可設定串流長度與是否失敗。
+    /// 假後端：每條連線每 10ms 送出固定位元組數，可設定總頻寬上限、串流長度與是否失敗。
     struct Fake {
         bytes_per_10ms: u64,
+        /// 所有連線共用的頻寬上限（每 10ms 的位元組數），模擬瓶頸
+        link_cap_per_10ms: Option<u64>,
+        active: AtomicU64,
         stream_len: Option<Duration>,
         fail: bool,
         max_conn: Option<usize>,
@@ -312,10 +387,22 @@ mod tests {
                 if self.fail {
                     anyhow::bail!("boom");
                 }
+                struct Active<'a>(&'a AtomicU64);
+                impl Drop for Active<'_> {
+                    fn drop(&mut self) {
+                        self.0.fetch_sub(1, Ordering::Relaxed);
+                    }
+                }
+                self.active.fetch_add(1, Ordering::Relaxed);
+                let _guard = Active(&self.active);
+
                 let start = Instant::now();
                 loop {
                     tokio::time::sleep(Duration::from_millis(10)).await;
-                    counter.fetch_add(self.bytes_per_10ms, Ordering::Relaxed);
+                    let share = self.link_cap_per_10ms.map_or(u64::MAX, |cap| {
+                        cap / self.active.load(Ordering::Relaxed).max(1)
+                    });
+                    counter.fetch_add(self.bytes_per_10ms.min(share), Ordering::Relaxed);
                     if self.stream_len.is_some_and(|len| start.elapsed() >= len) {
                         return Ok(());
                     }
@@ -335,7 +422,7 @@ mod tests {
 
     fn cfg(connections: usize) -> Config {
         Config {
-            connections,
+            connections: Connections::Fixed(connections),
             duration: Duration::from_secs(5),
             warmup: Duration::from_secs(1),
             interval: Duration::from_millis(200),
@@ -347,6 +434,8 @@ mod tests {
         // 125,000 bytes / 10ms = 100 Mbps
         Fake {
             bytes_per_10ms: 125_000,
+            link_cap_per_10ms: None,
+            active: AtomicU64::new(0),
             stream_len: None,
             fail: false,
             max_conn: None,
@@ -399,7 +488,7 @@ mod tests {
 
     fn latency_cfg() -> Config {
         Config {
-            connections: 2,
+            connections: Connections::Fixed(2),
             duration: Duration::from_millis(1000),
             warmup: Duration::from_millis(300),
             interval: Duration::from_millis(100),
@@ -471,5 +560,87 @@ mod tests {
         c.latency = latency_cfg().latency;
         let out = run(Arc::new(fake()), &c, |_| {}).await.unwrap();
         assert!(out.latency.unwrap().error.is_some());
+    }
+
+    // ── 動態連線數 ──
+
+    fn auto_cfg(max: usize) -> Config {
+        Config {
+            connections: Connections::Auto(AutoConfig {
+                start: 2,
+                max,
+                window: Duration::from_secs(1),
+                growth_threshold: 0.1,
+            }),
+            duration: Duration::from_secs(10),
+            warmup: Duration::from_secs(1),
+            interval: Duration::from_millis(200),
+            latency: None,
+        }
+    }
+
+    fn steps(out: &Outcome) -> Vec<usize> {
+        out.connection_steps.iter().map(|s| s.connections).collect()
+    }
+
+    /// 每條連線 100 Mbps、瓶頸 450 Mbps：要一路加到跑滿瓶頸才鎖定。
+    #[tokio::test(start_paused = true)]
+    async fn auto_scales_up_to_bottleneck() {
+        let backend = Fake {
+            link_cap_per_10ms: Some(562_500), // 450 Mbps
+            ..fake()
+        };
+        let out = run(Arc::new(backend), &auto_cfg(16), |_| {}).await.unwrap();
+        // 2→4 (+100%) →8 (+12.5%) →16 (+0%，鎖定)
+        assert_eq!(steps(&out), [2, 4, 8, 16]);
+        let steady = out.steady_start_secs.unwrap();
+        assert!((3.9..=4.3).contains(&steady), "steady = {steady}");
+        let avg = out.steady_avg_mbps();
+        assert!((avg - 450.0).abs() < 450.0 * 0.05, "avg = {avg}");
+        // 調整期間的樣本都算暖機
+        assert!(
+            out.samples
+                .iter()
+                .filter(|s| s.t_secs <= 4.0)
+                .all(|s| s.warmup)
+        );
+    }
+
+    /// 單一連線就能跑滿：試一次加倍沒幫助就停。
+    #[tokio::test(start_paused = true)]
+    async fn auto_stops_when_more_connections_do_not_help() {
+        let backend = Fake {
+            bytes_per_10ms: 10_000_000,
+            link_cap_per_10ms: Some(375_000), // 300 Mbps
+            ..fake()
+        };
+        let out = run(Arc::new(backend), &auto_cfg(16), |_| {}).await.unwrap();
+        assert_eq!(steps(&out), [2, 4]);
+        assert_eq!(out.connections, 4);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn auto_respects_max_and_backend_limit() {
+        let out = run(Arc::new(fake()), &auto_cfg(6), |_| {}).await.unwrap();
+        assert_eq!(steps(&out), [2, 4, 6]);
+
+        let backend = Fake {
+            max_conn: Some(1),
+            ..fake()
+        };
+        let out = run(Arc::new(backend), &auto_cfg(16), |_| {}).await.unwrap();
+        assert_eq!(steps(&out), [1]);
+        // 一開始就鎖定，暖機只看最短時間
+        assert_eq!(out.steady_start_secs, Some(1.0));
+    }
+
+    /// 一直沒有穩定時，過了一半的測試時間就強制鎖定。
+    #[tokio::test(start_paused = true)]
+    async fn auto_force_locks_at_half_duration() {
+        let mut c = auto_cfg(1024);
+        c.duration = Duration::from_secs(6);
+        let out = run(Arc::new(fake()), &c, |_| {}).await.unwrap();
+        assert_eq!(out.steady_start_secs, Some(3.0));
+        assert_eq!(steps(&out), [2, 4, 8]);
     }
 }
