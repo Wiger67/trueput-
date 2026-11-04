@@ -4,6 +4,27 @@ version = "0.1.0"
 edition = "2024"
 description = "輕量、方法透明的網路速度測試工具（下載、上傳、負載下延遲）"
 license = "MIT"
+default-run = "trueput"
+
+[lib]
+name = "trueput"
+path = "src/lib.rs"
+
+# 命令列版
+[[bin]]
+name = "trueput"
+path = "src/main.rs"
+
+# 視窗版（Windows 上就是 trueput-gui.exe）
+[[bin]]
+name = "trueput-gui"
+path = "src/gui/main.rs"
+required-features = ["gui"]
+
+[features]
+default = ["gui"]
+# 只要命令列版：cargo build --release --no-default-features
+gui = ["dep:eframe", "dep:egui_plot"]
 
 [dependencies]
 anyhow = "1"
@@ -24,6 +45,11 @@ rustls = { version = "0.23", default-features = false, features = ["ring", "std"
 tokio-tungstenite = { version = "0.30", features = ["rustls-tls-native-roots"] }
 futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
 
+# GUI：egui + glow（OpenGL）後端。比 wgpu 小很多，幾乎所有 Windows 電腦都能跑。
+# system_fonts：字型缺字時（例如中文）自動向系統借字型。
+eframe = { version = "0.37", optional = true, default-features = false, features = ["default_fonts", "system_fonts", "glow", "clipboard", "x11", "wayland"] }
+egui_plot = { version = "0.38", optional = true }
+
 [profile.release]
 opt-level = "z"
 lto = true
@@ -33,3 +59,7 @@ panic = "abort"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["test-util"] }
+
+# build.rs：Windows 版把圖示與版本資訊嵌進 exe（其他平台不會用到）
+[build-dependencies]
+winresource = "0.1"

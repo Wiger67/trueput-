@@ -28,6 +28,17 @@ pub struct Config {
     pub timeout: Duration,
 }
 
+impl Default for Config {
+    fn default() -> Self {
+        Self {
+            idle_probes: 10,
+            idle_interval: Duration::from_millis(100),
+            interval: Duration::from_millis(250),
+            timeout: Duration::from_secs(3),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Phase {

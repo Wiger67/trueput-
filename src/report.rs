@@ -8,16 +8,16 @@ use crate::latency::{Phase, Probe};
 use crate::stats::{LatencySummary, RttStats, Summary};
 
 /// 不同伺服器結果差距超過這個比例時，提醒使用者瓶頸可能在路徑上
-const SPREAD_WARN_PCT: f64 = 10.0;
+pub const SPREAD_WARN_PCT: f64 = 10.0;
 
-#[derive(Serialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct Report {
     pub results: Vec<BackendReport>,
     /// 測了兩台以上伺服器時的比較
     pub comparison: Option<Comparison>,
 }
 
-#[derive(Serialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct BackendReport {
     pub backend: &'static str,
     pub server: Option<ServerInfo>,
@@ -33,7 +33,7 @@ pub struct BackendReport {
     pub errors: Vec<String>,
 }
 
-#[derive(Serialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct DirectionReport {
     /// 後端名稱（只用於顯示）
     #[serde(skip)]
@@ -63,7 +63,7 @@ pub struct DirectionReport {
     pub stream_errors: Vec<String>,
 }
 
-#[derive(Serialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct ServerSideReport {
     /// 伺服器端確認的位元組數換算的速度
     pub steady_mbps: Option<f64>,
@@ -74,7 +74,7 @@ pub struct ServerSideReport {
     pub rtt_probes: Vec<Probe>,
 }
 
-#[derive(Serialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct Comparison {
     /// (最大 − 最小) / 最大，以主要結果比較
     pub download_spread_pct: Option<f64>,
@@ -115,39 +115,55 @@ impl BackendReport {
         slot.insert(report)
     }
 
-    fn median(&self, dir: Direction) -> Option<f64> {
-        let d = match dir {
-            Direction::Download => &self.download,
-            Direction::Upload => &self.upload,
-        };
-        d.as_ref()?.summary.as_ref().map(|s| s.mbps)
+    /// 某個方向的結果（還沒測或失敗時為 `None`）
+    pub fn direction(&self, dir: Direction) -> Option<&DirectionReport> {
+        match dir {
+            Direction::Download => self.download.as_ref(),
+            Direction::Upload => self.upload.as_ref(),
+        }
     }
 
-    pub fn print_header(&self) {
+    /// 某個方向的主要結果（Mbps）
+    pub fn mbps(&self, dir: Direction) -> Option<f64> {
+        self.direction(dir)?.summary.as_ref().map(|s| s.mbps)
+    }
+
+    /// 伺服器標題，例如「speed.cloudflare.com — TPE, Taipei, TW」
+    pub fn server_text(&self) -> String {
         let server = self.server.as_ref();
-        println!();
-        println!(
-            "━━ {}：{}{} ━━",
-            self.backend,
+        format!(
+            "{}{}",
             server.map_or("（未連線）", |s| s.name.as_str()),
             server
                 .and_then(|s| s.location.as_deref())
                 .map(|l| format!(" — {l}"))
                 .unwrap_or_default()
-        );
+        )
     }
 
-    pub fn print_idle(&self) {
+    /// 閒置延遲的說明；沒有量時為 `None`
+    pub fn idle_text(&self) -> Option<String> {
         match (&self.idle_latency, &self.latency_error) {
-            (Some(s), _) => println!(
+            (Some(s), _) => Some(format!(
                 "閒置延遲  {:.1} ms（最低 {:.1}，抖動 {:.1} ms）  [TCP 交握，{}]",
                 s.median_ms,
                 s.min_ms,
                 s.jitter_ms,
                 self.latency_addr.as_deref().unwrap_or("?")
-            ),
-            (None, Some(err)) => println!("閒置延遲  無法量測：{err}"),
-            (None, None) => {}
+            )),
+            (None, Some(err)) => Some(format!("閒置延遲  無法量測：{err}")),
+            (None, None) => None,
+        }
+    }
+
+    pub fn print_header(&self) {
+        println!();
+        println!("━━ {}：{} ━━", self.backend, self.server_text());
+    }
+
+    pub fn print_idle(&self) {
+        if let Some(t) = self.idle_text() {
+            println!("{t}");
         }
     }
 }
@@ -204,22 +220,28 @@ impl DirectionReport {
         }
     }
 
-    pub fn print_human(&self) {
+    /// 主要結果，例如「下載      91.8 Mbps」
+    pub fn headline(&self) -> String {
         let label = self.direction.label();
         match &self.summary {
-            Some(s) => {
-                println!("{label}      {:.1} Mbps", s.mbps);
-                println!(
-                    "  每秒起伏 P10–P90：{:.1} – {:.1} Mbps，中位數 {:.1}，最高 {:.1}（{} 個樣本）",
-                    s.p10_mbps, s.p90_mbps, s.median_mbps, s.max_mbps, s.samples
-                );
+            Some(s) => format!("{label}      {:.1} Mbps", s.mbps),
+            None => {
+                format!("{label}      測試太短，暖機結束後沒有任何樣本，請加長測試時間或縮短暖機。")
             }
-            None => println!(
-                "{label}      測試太短，暖機結束後沒有任何樣本，請加長測試時間或縮短暖機。"
-            ),
+        }
+    }
+
+    /// 細節說明（每秒起伏、連線數、延遲、伺服器端對照、警告），每個元素一行
+    pub fn detail_lines(&self) -> Vec<String> {
+        let label = self.direction.label();
+        let mut lines = Vec::new();
+        if let Some(s) = &self.summary {
+            lines.push(format!(
+                "每秒起伏 P10–P90：{:.1} – {:.1} Mbps，中位數 {:.1}，最高 {:.1}（{} 個樣本）",
+                s.p10_mbps, s.p90_mbps, s.median_mbps, s.max_mbps, s.samples
+            ));
         }
 
-        let conn = self.connection_text();
         let warmup = self
             .warmup_secs
             .map_or("整場".into(), |w| format!("{w:.1}s"));
@@ -228,16 +250,17 @@ impl DirectionReport {
         } else {
             ""
         };
-        println!(
-            "  連線數 {conn}；測試 {:.1}s（暖機 {warmup}{stop}），共 {:.1} MB",
+        lines.push(format!(
+            "連線數 {}；測試 {:.1}s（暖機 {warmup}{stop}），共 {:.1} MB",
+            self.connection_text(),
             self.elapsed_secs,
             self.total_bytes as f64 / 1_000_000.0
-        );
+        ));
 
         if let Some(lat) = &self.latency {
             match (&lat.loaded, lat.increase_ms, lat.bufferbloat_grade) {
-                (Some(l), Some(inc), Some(grade)) => println!(
-                    "  {label}中延遲 {:.1} ms（P90 {:.1}，抖動 {:.1}{}）→ 比閒置 +{inc:.1} ms，Bufferbloat 等級 {grade}",
+                (Some(l), Some(inc), Some(grade)) => lines.push(format!(
+                    "{label}中延遲 {:.1} ms（P90 {:.1}，抖動 {:.1}{}）→ 比閒置 +{inc:.1} ms，Bufferbloat 等級 {grade}",
                     l.median_ms,
                     l.p90_ms,
                     l.jitter_ms,
@@ -246,8 +269,8 @@ impl DirectionReport {
                     } else {
                         String::new()
                     }
-                ),
-                (Some(l), _, _) => println!("  {label}中延遲 {:.1} ms", l.median_ms),
+                )),
+                (Some(l), _, _) => lines.push(format!("{label}中延遲 {:.1} ms", l.median_ms)),
                 (None, _, _) => {}
             }
         }
@@ -263,22 +286,30 @@ impl DirectionReport {
                 .as_ref()
                 .map(|r| format!("，核心 RTT {:.1} ms", r.median_ms))
                 .unwrap_or_default();
-            println!("  伺服器端（TCPInfo）：{speed}{rtt}");
+            lines.push(format!("伺服器端（TCPInfo）：{speed}{rtt}"));
         }
 
         if !self.stream_errors.is_empty() {
-            println!(
-                "  警告：有 {} 條串流發生錯誤，結果可能偏低。第一個錯誤：{}",
+            lines.push(format!(
+                "警告：有 {} 條串流發生錯誤，結果可能偏低。第一個錯誤：{}",
                 self.stream_errors.len(),
                 self.stream_errors[0]
-            );
+            ));
+        }
+        lines
+    }
+
+    pub fn print_human(&self) {
+        println!("{}", self.headline());
+        for line in self.detail_lines() {
+            println!("  {line}");
         }
     }
 }
 
 impl DirectionReport {
     /// 連線數的說明文字。
-    fn connection_text(&self) -> String {
+    pub fn connection_text(&self) -> String {
         // 協定只允許 1 條（例如 ndt7）：不論設定為何都只能 1 條，「自動：1」沒有意義
         if self.connection_limit == Some(1) {
             return format!("1（{} 規範固定 1 條）", self.backend);
@@ -313,7 +344,7 @@ impl Report {
     pub fn new(results: Vec<BackendReport>) -> Self {
         let comparison = (results.len() >= 2).then(|| {
             let collect =
-                |dir| -> Vec<f64> { results.iter().filter_map(|r| r.median(dir)).collect() };
+                |dir| -> Vec<f64> { results.iter().filter_map(|r| r.mbps(dir)).collect() };
             Comparison {
                 download_spread_pct: spread_pct(&collect(Direction::Download)),
                 upload_spread_pct: spread_pct(&collect(Direction::Upload)),
@@ -341,8 +372,8 @@ impl Report {
                 println!(
                     "  {:<12} 下載 {:>8} Mbps   上傳 {:>8} Mbps   延遲（閒置/下載中/上傳中）{} / {} / {} ms",
                     r.backend,
-                    fmt(r.median(Direction::Download)),
-                    fmt(r.median(Direction::Upload)),
+                    fmt(r.mbps(Direction::Download)),
+                    fmt(r.mbps(Direction::Upload)),
                     fmt(r.idle_latency.as_ref().map(|s| s.median_ms)),
                     fmt(loaded(&r.download)),
                     fmt(loaded(&r.upload)),

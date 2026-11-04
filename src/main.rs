@@ -1,20 +1,13 @@
-mod autoscale;
-mod backend;
-mod engine;
-mod latency;
-mod report;
-mod stats;
+//! 命令列版。視窗版見 `src/gui/`。
 
 use std::io::{IsTerminal, Write};
-use std::sync::Arc;
 use std::time::Duration;
 
-use anyhow::Context;
 use clap::{Parser, ValueEnum};
 
-use backend::cloudflare::Cloudflare;
-use backend::ndt7::Ndt7;
-use backend::{Backend, Direction};
+use trueput::backend::Direction;
+use trueput::runner::{self, Progress};
+use trueput::{autoscale, engine, latency, report};
 
 /// 輕量、方法透明的網路速度測試工具
 #[derive(Parser, Debug)]
@@ -144,12 +137,14 @@ fn backend_list(kinds: &[BackendKind]) -> Vec<BackendKind> {
     out
 }
 
-fn make_backend(kind: BackendKind, args: &Args) -> anyhow::Result<Box<dyn Backend>> {
-    Ok(match kind {
-        BackendKind::Cloudflare => Box::new(Cloudflare::new(args.cf_request_mb * 1_000_000)?),
-        BackendKind::Ndt7 => Box::new(Ndt7::new()?),
-        BackendKind::All => unreachable!("all 已在 backend_list 展開"),
-    })
+impl BackendKind {
+    fn to_runner(self) -> Option<runner::BackendKind> {
+        match self {
+            BackendKind::Cloudflare => Some(runner::BackendKind::Cloudflare),
+            BackendKind::Ndt7 => Some(runner::BackendKind::Ndt7),
+            BackendKind::All => None,
+        }
+    }
 }
 
 fn progress_line(dir: Direction, s: &engine::Sample) {
@@ -194,88 +189,56 @@ async fn main() -> anyhow::Result<()> {
         duration: Duration::from_secs_f64(args.duration),
         warmup: Duration::from_secs_f64(args.warmup),
         interval: Duration::from_millis(args.interval_ms),
-        sample_window: Duration::from_secs(1),
         latency: (!args.no_latency).then(|| latency::Config {
-            idle_probes: 10,
-            idle_interval: Duration::from_millis(100),
             interval: Duration::from_millis(args.latency_interval_ms),
-            timeout: Duration::from_secs(3),
+            ..Default::default()
         }),
         early_stop: (!args.no_early_stop).then(engine::EarlyStop::default),
+        ..Default::default()
     };
 
     let human = !args.json;
     let progress = human && std::io::stderr().is_terminal();
+    let opts = runner::Options {
+        cf_request_bytes: args.cf_request_mb * 1_000_000,
+    };
     let mut results = Vec::new();
 
     for kind in backend_list(&args.backend) {
-        let mut backend = make_backend(kind, &args)?;
-        let mut rep = report::BackendReport::new(backend.name());
-
-        status(progress, &format!("連線到 {}…", backend.name()));
-        match backend.prepare().await.context("準備測試失敗") {
-            Ok(server) => rep.server = Some(server),
-            Err(e) => {
-                status(progress, "");
-                rep.errors.push(format!("{e:#}"));
-                if human {
-                    rep.print_header();
-                    println!("錯誤：{e:#}");
-                }
-                results.push(rep);
-                continue;
-            }
-        }
-        let backend: Arc<dyn Backend> = Arc::from(backend);
-
-        // 閒置延遲只量一次，下載與上傳共用
-        let idle = match &cfg.latency {
-            Some(lc) => {
-                status(progress, "量測閒置延遲…");
-                let idle = engine::measure_idle(backend.as_ref(), lc).await;
-                rep.set_idle(&idle);
-                Some(idle)
-            }
-            None => None,
-        };
-        status(progress, "");
-        if human {
-            rep.print_header();
-            rep.print_idle();
-        }
-
-        for &dir in args.test.directions() {
-            if !backend.supports(dir) {
-                let msg = format!("{} 不支援{}測試", backend.name(), dir.label());
-                if human {
-                    println!("{msg}");
-                }
-                rep.errors.push(msg);
-                continue;
-            }
-            let res = engine::run(backend.clone(), dir, &cfg, idle.as_ref(), |s| {
+        let kind = kind.to_runner().expect("all 已在 backend_list 展開");
+        let rep = runner::run_backend(kind, &cfg, args.test.directions(), &opts, |p| match p {
+            Progress::Status(msg) => status(progress, msg),
+            Progress::Sample(dir, s) => {
                 if progress {
                     progress_line(dir, s);
                 }
-            })
-            .await;
-            status(progress, "");
-            match res {
-                Ok(out) => {
-                    let d = rep.set_direction(&cfg, &out);
-                    if human {
-                        d.print_human();
+            }
+            Progress::Ready(rep) => {
+                status(progress, "");
+                if human {
+                    rep.print_header();
+                    match rep.server {
+                        Some(_) => rep.print_idle(),
+                        None => println!("錯誤：{}", rep.errors.last().map_or("", String::as_str)),
                     }
-                }
-                Err(e) => {
-                    let msg = format!("{}失敗：{e:#}", dir.label());
-                    if human {
-                        println!("{msg}");
-                    }
-                    rep.errors.push(msg);
                 }
             }
-        }
+            Progress::DirectionDone(rep, dir) => {
+                status(progress, "");
+                if !human {
+                    return;
+                }
+                let done = match dir {
+                    Direction::Download => &rep.download,
+                    Direction::Upload => &rep.upload,
+                };
+                match done {
+                    Some(d) => d.print_human(),
+                    None => println!("{}", rep.errors.last().map_or("", String::as_str)),
+                }
+            }
+        })
+        .await;
         results.push(rep);
     }
 

@@ -84,6 +84,21 @@ pub struct Config {
     pub early_stop: Option<EarlyStop>,
 }
 
+impl Default for Config {
+    /// 預設設定：自動連線數、每個方向最多 15 秒、暖機至少 3 秒、量延遲、可提前結束。
+    fn default() -> Self {
+        Self {
+            connections: Connections::Auto(AutoConfig::default()),
+            duration: Duration::from_secs(15),
+            warmup: Duration::from_secs(3),
+            interval: Duration::from_millis(200),
+            sample_window: Duration::from_secs(1),
+            latency: Some(latency::Config::default()),
+            early_stop: Some(EarlyStop::default()),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct Sample {
     /// 從測試開始算起的秒數（這個樣本的結束時間點）
@@ -179,6 +194,19 @@ impl Outcome {
 
     pub fn steady_avg_mbps(&self) -> f64 {
         mbps(self.steady_bytes, self.steady_secs)
+    }
+}
+
+/// 背景 task 的 handle，被丟掉時自動中止 task。
+///
+/// `run` 的 future 可能在中途被丟掉（例如使用者按下「停止」），
+/// 這時延遲量測 task 必須跟著停，不能在背景一直跑下去。
+/// （傳輸串流放在 `JoinSet` 裡，丟掉時本來就會自動中止。）
+struct AbortOnDrop(tokio::task::JoinHandle<()>);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
     }
 }
 
@@ -332,7 +360,7 @@ pub async fn run(
     let probe_task = match (&cfg.latency, idle.and_then(|i| i.prober.clone())) {
         (Some(lc), Some(prober)) => {
             let (probes, interval, steady) = (loaded_probes.clone(), lc.interval, steady.clone());
-            Some(tokio::spawn(async move {
+            Some(AbortOnDrop(tokio::spawn(async move {
                 let mut tick = tokio::time::interval(interval);
                 tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
                 loop {
@@ -350,7 +378,7 @@ pub async fn run(
                         phase,
                     });
                 }
-            }))
+            })))
         }
         _ => None,
     };
@@ -468,9 +496,7 @@ pub async fn run(
         }
     }
     // 先停延遲量測，避免傳輸結束後量到的「閒置」數值混進負載下延遲
-    if let Some(task) = probe_task {
-        task.abort();
-    }
+    drop(probe_task);
     workers.abort_all();
     // 等串流真的停下來，下一個測試（例如上傳）才不會被殘留的流量干擾
     while workers.join_next().await.is_some() {}
@@ -1050,5 +1076,45 @@ mod tests {
             run_dl(fake(), &cfg(2)).await.unwrap().connection_limit,
             None
         );
+    }
+
+    /// 測試中途被取消（GUI 的「停止」）時，延遲量測 task 也要跟著停。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cancelling_run_stops_latency_probes() {
+        use std::sync::atomic::AtomicUsize;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let accepted = Arc::new(AtomicUsize::new(0));
+        let counter = accepted.clone();
+        let server = tokio::spawn(async move {
+            loop {
+                let _ = listener.accept().await;
+                counter.fetch_add(1, Ordering::Relaxed);
+            }
+        });
+
+        let backend: Arc<dyn Backend> = Arc::new(Fake {
+            latency_target: Some(("127.0.0.1".into(), port)),
+            ..fake()
+        });
+        let mut c = latency_cfg();
+        c.duration = Duration::from_secs(30);
+        let idle = measure_idle(backend.as_ref(), c.latency.as_ref().unwrap()).await;
+
+        // 跑 400ms 後丟掉 future（等同按下停止）
+        let run = run(backend, Direction::Download, &c, Some(&idle), |_| {});
+        assert!(
+            tokio::time::timeout(Duration::from_millis(400), run)
+                .await
+                .is_err()
+        );
+
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let after_cancel = accepted.load(Ordering::Relaxed);
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        // 量測間隔 50ms：如果 task 還活著，這 400ms 內會多出約 8 次連線
+        assert_eq!(accepted.load(Ordering::Relaxed), after_cancel);
+        server.abort();
     }
 }

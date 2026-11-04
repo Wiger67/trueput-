@@ -1,0 +1,7 @@
+# Windows（MSVC 工具鏈）：靜態連結 C runtime。
+# 產生的 exe 不需要使用者另外安裝「Visual C++ 可轉散發套件」，複製到任何 Windows 電腦都能直接執行。
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]
+
+[target.aarch64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]
