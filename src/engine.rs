@@ -39,6 +39,12 @@ pub enum Connections {
 /// 上傳時自動調整連線數的最短評估窗格
 const UPLOAD_MIN_SCALE_WINDOW: Duration = Duration::from_secs(2);
 
+/// 上傳提前結束的最低容許變化幅度。
+///
+/// 上傳計的是「交給 socket 的位元組」，會隨緩衝區一批一批進來，累積平均會呈鋸齒狀，
+/// 振幅約為「一批的大小 ÷ 已傳總量」，要比下載多傳一段時間才會縮到 2% 以下。
+const UPLOAD_MIN_TOLERANCE: f64 = 0.03;
+
 /// 提前結束的條件，見 [`Stability`]。
 #[derive(Debug, Clone)]
 pub struct EarlyStop {
@@ -46,7 +52,7 @@ pub struct EarlyStop {
     pub min_steady: Duration,
     /// 觀察累積平均變化的時間範圍
     pub window: Duration,
-    /// 變化幅度小於這個比例就算穩定，0.02 = 2%
+    /// 變化幅度小於這個比例就算穩定，0.02 = 2%（上傳至少 3%）
     pub tolerance: f64,
 }
 
@@ -138,6 +144,8 @@ pub struct Outcome {
     pub samples: Vec<Sample>,
     /// 最終使用的連線數
     pub connections: usize,
+    /// 後端（協定或伺服器政策）允許的最大連線數
+    pub connection_limit: Option<usize>,
     /// 連線數的變化（第一筆為初始值）
     pub connection_steps: Vec<ConnectionStep>,
     /// 自動模式的評估窗格（秒）
@@ -348,9 +356,12 @@ pub async fn run(
     };
 
     let mut tick = tokio::time::interval(cfg.interval);
-    // 落後時不要連續補 tick，否則會產生時間極短、數值很亂的樣本
-    tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
+    // 落後時直接跳過錯過的 tick：不會連續補 tick（產生時間極短、數值很亂的樣本），
+    // 也不會像 Delay 那樣每次延遲都往後累積，讓取樣時間點越飄越遠。
+    tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
     tick.tick().await; // 第一次 tick 會立刻完成
+    // 測試剛好在上限時間結束：最後一次取樣對齊 deadline，不會超出
+    let deadline = start + cfg.duration;
 
     let mut samples = Vec::new();
     let mut stream_errors = Vec::new();
@@ -361,16 +372,23 @@ pub async fn run(
     let mut steady_start: Option<(u64, Instant)> = None;
     let (mut window_bytes, mut window_t) = (0u64, start);
     let mut stability = cfg.early_stop.as_ref().map(|e| {
+        let tolerance = match dir {
+            Direction::Download => e.tolerance,
+            Direction::Upload => e.tolerance.max(UPLOAD_MIN_TOLERANCE),
+        };
         Stability::new(
             e.min_steady.as_secs_f64(),
             e.window.as_secs_f64(),
-            e.tolerance,
+            tolerance,
         )
     });
     let mut early_stopped = false;
 
     loop {
-        tick.tick().await;
+        tokio::select! {
+            _ = tick.tick() => {}
+            _ = tokio::time::sleep_until(deadline) => {}
+        }
         let now = Instant::now();
         let bytes = counter.load(Ordering::Relaxed);
         let elapsed = now - start;
@@ -488,6 +506,7 @@ pub async fn run(
         direction: dir,
         samples,
         connections,
+        connection_limit: backend.max_connections(),
         connection_steps,
         scale_window_secs: window.map(|w| w.as_secs_f64()),
         steady_start_secs: steady_start.map(|(_, t)| (t - start).as_secs_f64()),
@@ -898,8 +917,11 @@ mod tests {
         assert_eq!(Idle::default().median_rtt(), None);
     }
 
-    /// 模擬 socket 緩衝區造成的「一陣一陣」：每 500ms 一次送出 1 MB（平均 16 Mbps）。
-    struct Bursty;
+    /// 模擬 socket 緩衝區造成的「一陣一陣」：每隔 `period` 一次送出 `bytes`。
+    struct Bursty {
+        bytes: u64,
+        period: Duration,
+    }
 
     impl Backend for Bursty {
         fn name(&self) -> &'static str {
@@ -918,8 +940,8 @@ mod tests {
         ) -> BoxFuture<'_, anyhow::Result<()>> {
             Box::pin(async move {
                 loop {
-                    tokio::time::sleep(Duration::from_millis(500)).await;
-                    counter.fetch_add(1_000_000, Ordering::Relaxed);
+                    tokio::time::sleep(self.period).await;
+                    counter.fetch_add(self.bytes, Ordering::Relaxed);
                 }
             })
         }
@@ -929,7 +951,12 @@ mod tests {
     async fn bursty_transfer_is_measured_correctly() {
         let mut c = cfg(1);
         c.duration = Duration::from_secs(10);
-        let out = run(Arc::new(Bursty), Direction::Upload, &c, None, |_| {})
+        // 每 500ms 1 MB，平均 16 Mbps
+        let bursty = Bursty {
+            bytes: 1_000_000,
+            period: Duration::from_millis(500),
+        };
+        let out = run(Arc::new(bursty), Direction::Upload, &c, None, |_| {})
             .await
             .unwrap();
         // 主要結果：總量 ÷ 時間
@@ -967,5 +994,61 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(out.scale_window_secs, Some(2.0));
+    }
+
+    /// 取樣間隔無法整除測試長度時，也要剛好在上限結束，不能超出。
+    #[tokio::test(start_paused = true)]
+    async fn ends_exactly_at_duration() {
+        let mut c = cfg(1);
+        c.interval = Duration::from_millis(300);
+        c.duration = Duration::from_secs(1);
+        c.warmup = Duration::from_millis(300);
+        let out = run_dl(fake(), &c).await.unwrap();
+        assert_eq!(out.elapsed_secs, 1.0);
+        assert_eq!(out.samples.last().unwrap().t_secs, 1.0);
+    }
+
+    /// 上傳的鋸齒狀累積平均：容許 3% 時比下載（2%）更早判定穩定。
+    #[tokio::test(start_paused = true)]
+    async fn upload_early_stop_tolerates_buffer_sawtooth() {
+        let mut c = cfg(1);
+        c.duration = Duration::from_secs(15);
+        c.early_stop = Some(EarlyStop::default());
+        // 每 125ms 250 KB（16 Mbps）：鋸齒振幅在 2%～3% 之間的時間會持續好幾秒
+        let bursty = || {
+            Arc::new(Bursty {
+                bytes: 250_000,
+                period: Duration::from_millis(125),
+            })
+        };
+        let dl = run(bursty(), Direction::Download, &c, None, |_| {})
+            .await
+            .unwrap();
+        let ul = run(bursty(), Direction::Upload, &c, None, |_| {})
+            .await
+            .unwrap();
+        assert!(dl.early_stopped && ul.early_stopped);
+        assert!(
+            ul.elapsed_secs < dl.elapsed_secs,
+            "upload {} vs download {}",
+            ul.elapsed_secs,
+            dl.elapsed_secs
+        );
+        // 提前結束也不能犧牲準確度
+        assert!((ul.steady_avg_mbps() - 16.0).abs() < 16.0 * 0.03);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn reports_backend_connection_limit() {
+        let backend = Fake {
+            max_conn: Some(1),
+            ..fake()
+        };
+        let out = run_dl(backend, &auto_cfg(16)).await.unwrap();
+        assert_eq!(out.connection_limit, Some(1));
+        assert_eq!(
+            run_dl(fake(), &cfg(2)).await.unwrap().connection_limit,
+            None
+        );
     }
 }

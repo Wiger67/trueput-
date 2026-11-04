@@ -35,11 +35,16 @@ pub struct BackendReport {
 
 #[derive(Serialize)]
 pub struct DirectionReport {
+    /// 後端名稱（只用於顯示）
+    #[serde(skip)]
+    backend: &'static str,
     pub direction: Direction,
     /// "auto" 或 "fixed"
     pub connection_mode: &'static str,
     /// 最終連線數
     pub connections: usize,
+    /// 後端（協定或伺服器政策）允許的最大連線數
+    pub connection_limit: Option<usize>,
     pub connection_steps: Vec<ConnectionStep>,
     /// 自動模式的評估窗格（秒）
     pub scale_window_secs: Option<f64>,
@@ -102,7 +107,7 @@ impl BackendReport {
 
     /// 加入一個方向的結果，回傳它的報告（方便立刻印出）。
     pub fn set_direction(&mut self, cfg: &Config, out: &Outcome) -> &DirectionReport {
-        let report = DirectionReport::new(cfg, out, &self.idle_probes);
+        let report = DirectionReport::new(self.backend, cfg, out, &self.idle_probes);
         let slot = match out.direction {
             Direction::Download => &mut self.download,
             Direction::Upload => &mut self.upload,
@@ -148,7 +153,7 @@ impl BackendReport {
 }
 
 impl DirectionReport {
-    fn new(cfg: &Config, out: &Outcome, idle_probes: &[Probe]) -> Self {
+    fn new(backend: &'static str, cfg: &Config, out: &Outcome, idle_probes: &[Probe]) -> Self {
         let summary = Summary::from_samples(&out.steady_samples(), out.steady_avg_mbps());
         let loaded_probes = out.loaded_probes.clone().unwrap_or_default();
         let latency = out.loaded_probes.as_ref().map(|loaded| {
@@ -176,12 +181,14 @@ impl DirectionReport {
         });
 
         Self {
+            backend,
             direction: out.direction,
             connection_mode: match cfg.connections {
                 Connections::Auto(_) => "auto",
                 Connections::Fixed(_) => "fixed",
             },
             connections: out.connections,
+            connection_limit: out.connection_limit,
             connection_steps: out.connection_steps.clone(),
             scale_window_secs: out.scale_window_secs,
             warmup_secs: out.steady_start_secs,
@@ -212,21 +219,7 @@ impl DirectionReport {
             ),
         }
 
-        let conn = if self.connection_mode == "auto" {
-            let path: Vec<String> = self
-                .connection_steps
-                .iter()
-                .map(|s| s.connections.to_string())
-                .collect();
-            let window = self
-                .scale_window_secs
-                .filter(|&w| w > 1.0)
-                .map(|w| format!("，評估窗格 {w:.1}s"))
-                .unwrap_or_default();
-            format!("{}（自動：{}{window}）", self.connections, path.join(" → "))
-        } else {
-            self.connections.to_string()
-        };
+        let conn = self.connection_text();
         let warmup = self
             .warmup_secs
             .map_or("整場".into(), |w| format!("{w:.1}s"));
@@ -280,6 +273,30 @@ impl DirectionReport {
                 self.stream_errors[0]
             );
         }
+    }
+}
+
+impl DirectionReport {
+    /// 連線數的說明文字。
+    fn connection_text(&self) -> String {
+        // 協定只允許 1 條（例如 ndt7）：不論設定為何都只能 1 條，「自動：1」沒有意義
+        if self.connection_limit == Some(1) {
+            return format!("1（{} 規範固定 1 條）", self.backend);
+        }
+        if self.connection_mode != "auto" {
+            return self.connections.to_string();
+        }
+        let path: Vec<String> = self
+            .connection_steps
+            .iter()
+            .map(|s| s.connections.to_string())
+            .collect();
+        let window = self
+            .scale_window_secs
+            .filter(|&w| w > 1.0)
+            .map(|w| format!("，評估窗格 {w:.1}s"))
+            .unwrap_or_default();
+        format!("{}（自動：{}{window}）", self.connections, path.join(" → "))
     }
 }
 
@@ -359,5 +376,51 @@ mod tests {
         assert_eq!(spread_pct(&[100.0]), None);
         assert_eq!(spread_pct(&[100.0, 90.0]), Some(10.0));
         assert_eq!(spread_pct(&[0.0, 0.0]), None);
+    }
+
+    fn dir_report(mode: &'static str, limit: Option<usize>, steps: &[usize]) -> DirectionReport {
+        DirectionReport {
+            backend: "ndt7",
+            direction: Direction::Download,
+            connection_mode: mode,
+            connections: *steps.last().unwrap(),
+            connection_limit: limit,
+            connection_steps: steps
+                .iter()
+                .map(|&c| ConnectionStep {
+                    t_secs: 0.0,
+                    connections: c,
+                })
+                .collect(),
+            scale_window_secs: Some(2.0),
+            warmup_secs: None,
+            elapsed_secs: 0.0,
+            early_stopped: false,
+            total_bytes: 0,
+            summary: None,
+            latency: None,
+            server_side: None,
+            samples: vec![],
+            loaded_probes: vec![],
+            stream_errors: vec![],
+        }
+    }
+
+    #[test]
+    fn connection_text() {
+        // 協定固定 1 條：自動或固定模式都顯示規範
+        assert_eq!(
+            dir_report("auto", Some(1), &[1]).connection_text(),
+            "1（ndt7 規範固定 1 條）"
+        );
+        assert_eq!(
+            dir_report("fixed", Some(1), &[1]).connection_text(),
+            "1（ndt7 規範固定 1 條）"
+        );
+        assert_eq!(
+            dir_report("auto", None, &[2, 4]).connection_text(),
+            "4（自動：2 → 4，評估窗格 2.0s）"
+        );
+        assert_eq!(dir_report("fixed", None, &[8]).connection_text(), "8");
     }
 }
