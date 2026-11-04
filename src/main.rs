@@ -1,5 +1,6 @@
 mod backend;
 mod engine;
+mod latency;
 mod report;
 mod stats;
 
@@ -41,6 +42,14 @@ struct Args {
     /// Cloudflare 每次請求的下載大小（MB）
     #[arg(long, default_value_t = 25)]
     cf_request_mb: u64,
+
+    /// 不量延遲（閒置與負載下）
+    #[arg(long)]
+    no_latency: bool,
+
+    /// 下載期間延遲量測的間隔（毫秒）
+    #[arg(long, default_value_t = 250, value_parser = clap::value_parser!(u64).range(50..=5000))]
+    latency_interval_ms: u64,
 
     /// 以 JSON 輸出結果（含所有樣本）
     #[arg(long)]
@@ -102,13 +111,28 @@ async fn main() -> anyhow::Result<()> {
         duration: Duration::from_secs_f64(args.duration),
         warmup: Duration::from_secs_f64(args.warmup),
         interval: Duration::from_millis(args.interval_ms),
+        latency: (!args.no_latency).then(|| latency::Config {
+            idle_probes: 10,
+            idle_interval: Duration::from_millis(100),
+            interval: Duration::from_millis(args.latency_interval_ms),
+            timeout: Duration::from_secs(3),
+        }),
     };
+
+    if progress && cfg.latency.is_some() {
+        eprint!("量測閒置延遲…");
+        let _ = std::io::stderr().flush();
+    }
 
     let backend: Arc<dyn Backend> = Arc::from(backend);
     let outcome = engine::run(backend.clone(), &cfg, |s| {
         if progress {
             let tag = if s.warmup { " (暖機)" } else { "" };
-            eprint!("\r\x1b[2K{:5.1}s  {:9.1} Mbps{tag}", s.t_secs, s.mbps);
+            let rtt = s
+                .latest_rtt_ms
+                .map(|r| format!("  {r:7.1} ms"))
+                .unwrap_or_default();
+            eprint!("\r\x1b[2K{:5.1}s  {:9.1} Mbps{rtt}{tag}", s.t_secs, s.mbps);
             let _ = std::io::stderr().flush();
         }
     })

@@ -4,7 +4,8 @@ use serde::Serialize;
 
 use crate::backend::ServerInfo;
 use crate::engine::{Config, Outcome, Sample};
-use crate::stats::Summary;
+use crate::latency::Probe;
+use crate::stats::{LatencySummary, RttStats, Summary};
 
 #[derive(Serialize)]
 pub struct Report {
@@ -18,6 +19,18 @@ pub struct Report {
     pub summary: Option<Summary>,
     pub samples: Vec<Sample>,
     pub stream_errors: Vec<String>,
+    /// 延遲量測；`None` 表示沒有啟用
+    pub latency: Option<LatencyReport>,
+}
+
+#[derive(Serialize)]
+pub struct LatencyReport {
+    /// 量測方式
+    pub method: &'static str,
+    pub addr: Option<String>,
+    pub summary: LatencySummary,
+    pub probes: Vec<Probe>,
+    pub error: Option<String>,
 }
 
 impl Report {
@@ -32,6 +45,13 @@ impl Report {
             summary: Summary::from_samples(&out.steady_samples(), out.steady_avg_mbps()),
             samples: out.samples.clone(),
             stream_errors: out.stream_errors.clone(),
+            latency: out.latency.as_ref().map(|l| LatencyReport {
+                method: "tcp_connect",
+                addr: l.addr.clone(),
+                summary: LatencySummary::from_probes(&l.probes),
+                probes: l.probes.clone(),
+                error: l.error.clone(),
+            }),
         }
     }
 
@@ -59,6 +79,10 @@ impl Report {
         );
         println!("  註：數值為應用層 goodput，不含 TCP/IP/TLS 標頭，約比線路速度低 3–6%。");
 
+        if let Some(lat) = &self.latency {
+            print_latency(lat);
+        }
+
         if !self.stream_errors.is_empty() {
             println!(
                 "警告：有 {} 條串流發生錯誤，結果可能偏低。第一個錯誤：{}",
@@ -66,5 +90,38 @@ impl Report {
                 self.stream_errors[0]
             );
         }
+    }
+}
+
+fn print_latency(lat: &LatencyReport) {
+    println!();
+    match &lat.addr {
+        Some(addr) => println!("延遲（TCP 交握，{addr}）："),
+        None => println!("延遲："),
+    }
+
+    let line = |label: &str, s: &Option<RttStats>| match s {
+        Some(s) => println!(
+            "  {label}  {:6.1} ms（最低 {:.1}，P90 {:.1}，抖動 {:.1} ms）{}",
+            s.median_ms,
+            s.min_ms,
+            s.p90_ms,
+            s.jitter_ms,
+            if s.lost > 0 {
+                format!("，遺失 {} 次", s.lost)
+            } else {
+                String::new()
+            }
+        ),
+        None => println!("  {label}  無資料"),
+    };
+    line("閒置  ", &lat.summary.idle);
+    line("下載中", &lat.summary.loaded);
+
+    if let (Some(inc), Some(grade)) = (lat.summary.increase_ms, lat.summary.bufferbloat_grade) {
+        println!("  增加   +{inc:.1} ms → Bufferbloat 等級 {grade}");
+    }
+    if let Some(err) = &lat.error {
+        println!("  無法量測延遲：{err}");
     }
 }

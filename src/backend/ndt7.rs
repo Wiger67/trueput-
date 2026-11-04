@@ -18,7 +18,7 @@ use futures_util::StreamExt;
 use serde::Deserialize;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
-use tokio_tungstenite::tungstenite::http::HeaderValue;
+use tokio_tungstenite::tungstenite::http::{HeaderValue, Uri};
 
 use super::{Backend, BoxFuture, ServerInfo};
 
@@ -142,5 +142,10 @@ impl Backend for Ndt7 {
 
     fn restart_streams(&self) -> bool {
         false
+    }
+
+    fn latency_target(&self) -> Option<(String, u16)> {
+        let uri: Uri = self.download_url.as_deref()?.parse().ok()?;
+        Some((uri.host()?.to_owned(), uri.port_u16().unwrap_or(443)))
     }
 }

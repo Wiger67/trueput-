@@ -51,4 +51,10 @@ pub trait Backend: Send + Sync {
     fn restart_streams(&self) -> bool {
         true
     }
+
+    /// 延遲量測的目標（主機, TCP port），應該是實際提供測速資料的那台伺服器。
+    /// 必須在 [`Backend::prepare`] 之後呼叫。`None` 表示不支援延遲量測。
+    fn latency_target(&self) -> Option<(String, u16)> {
+        None
+    }
 }

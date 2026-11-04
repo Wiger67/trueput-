@@ -10,6 +10,7 @@ use serde::Deserialize;
 
 use super::{Backend, BoxFuture, ServerInfo};
 
+const HOST: &str = "speed.cloudflare.com";
 const BASE: &str = "https://speed.cloudflare.com";
 
 pub struct Cloudflare {
@@ -64,7 +65,7 @@ impl Backend for Cloudflare {
             });
 
             Ok(ServerInfo {
-                name: "speed.cloudflare.com".into(),
+                name: HOST.into(),
                 location,
             })
         })
@@ -88,5 +89,9 @@ impl Backend for Cloudflare {
             }
             Ok(())
         })
+    }
+
+    fn latency_target(&self) -> Option<(String, u16)> {
+        Some((HOST.into(), 443))
     }
 }
