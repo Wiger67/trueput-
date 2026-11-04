@@ -1,4 +1,9 @@
-//! 主畫面：左邊設定、中間每台伺服器的結果卡片與即時圖表、最後是比較表。
+//! 主畫面，盡量簡單：
+//!
+//! - 上方三個大數字（下載、上傳、延遲）和一顆「開始測試」按鈕；
+//! - 測試進行中才出現即時圖表；
+//! - 每台伺服器一列的精簡表格，加一句結論；
+//! - 其餘技術細節收在預設摺疊的「詳細資料」，設定按「設定」才展開。
 //!
 //! 測試在背景的 tokio runtime 執行，透過 channel 把進度送回 UI 執行緒；
 //! 按「停止」會中止背景 task，傳輸與延遲量測都會跟著停。
@@ -15,11 +20,15 @@ use trueput::engine::{self, Connections, Sample};
 use trueput::latency;
 use trueput::report::{BackendReport, Report, SPREAD_WARN_PCT};
 use trueput::runner::{self, BackendKind, Progress};
+use trueput::stats::bufferbloat_grade;
 
 const DOWNLOAD_COLOR: Color32 = Color32::from_rgb(59, 130, 246);
 const UPLOAD_COLOR: Color32 = Color32::from_rgb(168, 85, 247);
 const ERROR_COLOR: Color32 = Color32::from_rgb(220, 38, 38);
 const WARN_COLOR: Color32 = Color32::from_rgb(217, 119, 6);
+
+/// 內容欄的最大寬度：視窗再寬也置中，不要拉得太散
+const CONTENT_WIDTH: f32 = 620.0;
 
 const DIRECTIONS: [Direction; 2] = [Direction::Download, Direction::Upload];
 
@@ -52,6 +61,16 @@ pub fn grade_color(grade: &str) -> Color32 {
         "C" => Color32::from_rgb(234, 88, 12),
         _ => ERROR_COLOR,
     }
+}
+
+fn grade_badge(ui: &mut egui::Ui, grade: &str) -> egui::Response {
+    ui.label(
+        RichText::new(format!(" {grade} "))
+            .strong()
+            .color(Color32::WHITE)
+            .background_color(grade_color(grade)),
+    )
+    .on_hover_text("Bufferbloat 等級：傳輸中延遲比閒置時增加越少越好（A+ 最好，F 最差）")
 }
 
 // ── 設定 ────────────────────────────────────────────────────
@@ -150,7 +169,6 @@ struct Job {
 /// 一台伺服器在畫面上的狀態
 struct BackendView {
     kind: BackendKind,
-    planned: Vec<Direction>,
     report: Option<BackendReport>,
     /// 即時樣本（下載、上傳）
     live: [Vec<Sample>; 2],
@@ -158,14 +176,95 @@ struct BackendView {
 }
 
 impl BackendView {
-    fn new(kind: BackendKind, planned: Vec<Direction>) -> Self {
+    fn new(kind: BackendKind) -> Self {
         Self {
             kind,
-            planned,
             report: None,
             live: [Vec::new(), Vec::new()],
             active: None,
         }
+    }
+
+    /// 正在測這個方向時的即時速度
+    fn live_mbps(&self, dir: Direction) -> Option<f64> {
+        (self.active == Some(dir))
+            .then(|| self.live[dir_index(dir)].last().map(|s| s.mbps))
+            .flatten()
+    }
+
+    fn idle_ms(&self) -> Option<f64> {
+        self.report
+            .as_ref()?
+            .idle_latency
+            .as_ref()
+            .map(|s| s.median_ms)
+    }
+
+    /// 各方向中最大的「傳輸中延遲增加量」（等級取最差的那個方向）
+    fn worst_increase_ms(&self) -> Option<f64> {
+        let r = self.report.as_ref()?;
+        DIRECTIONS
+            .into_iter()
+            .filter_map(|d| r.direction(d)?.latency.as_ref()?.increase_ms)
+            .reduce(f64::max)
+    }
+
+    /// 連不上伺服器（準備失敗）時的錯誤
+    fn connect_error(&self) -> Option<&str> {
+        let r = self.report.as_ref()?;
+        r.server
+            .is_none()
+            .then(|| r.errors.first().map_or("無法連線", String::as_str))
+    }
+}
+
+/// 上方大數字要顯示的內容
+#[derive(Debug, Default, PartialEq)]
+pub struct Hero {
+    /// 下載、上傳：(Mbps, 是否為測試中的即時值)
+    pub speed: [Option<(f64, bool)>; 2],
+    pub idle_ms: Option<f64>,
+    pub increase_ms: Option<f64>,
+    pub grade: Option<&'static str>,
+}
+
+/// 整理上方大數字：
+/// - 速度：正在測的方向顯示即時值；測完的取各伺服器中最高的（最接近你的線路上限，
+///   較低的通常是到該伺服器的路徑造成的）。
+/// - 延遲：取閒置延遲最低（最近）的那台伺服器，等級看它最差的方向。
+fn hero(views: &[BackendView]) -> Hero {
+    let mut h = Hero::default();
+    for dir in DIRECTIONS {
+        h.speed[dir_index(dir)] = views
+            .iter()
+            .find_map(|v| v.live_mbps(dir))
+            .map(|m| (m, true))
+            .or_else(|| {
+                views
+                    .iter()
+                    .filter_map(|v| v.report.as_ref()?.mbps(dir))
+                    .reduce(f64::max)
+                    .map(|m| (m, false))
+            });
+    }
+    if let Some(nearest) = views
+        .iter()
+        .filter(|v| v.idle_ms().is_some())
+        .min_by(|a, b| a.idle_ms().unwrap().total_cmp(&b.idle_ms().unwrap()))
+    {
+        h.idle_ms = nearest.idle_ms();
+        h.increase_ms = nearest.worst_increase_ms();
+        h.grade = h.increase_ms.map(bufferbloat_grade);
+    }
+    h
+}
+
+/// 延遲數字：10 ms 以下多一位小數（避免 0.3 ms 顯示成 0），以上取整數
+pub fn fmt_ms(ms: f64) -> String {
+    if ms < 10.0 {
+        format!("{ms:.1}")
+    } else {
+        format!("{ms:.0}")
     }
 }
 
@@ -187,12 +286,35 @@ pub fn split_series(samples: &[Sample]) -> (Vec<[f64; 2]>, Vec<[f64; 2]>) {
     (warm, steady)
 }
 
+/// 一句話的比較結論；不到兩台伺服器有結果時為 `None`
+fn verdict(report: &Report) -> Option<(String, bool)> {
+    let cmp = report.comparison.as_ref()?;
+    let worst = [cmp.download_spread_pct, cmp.upload_spread_pct]
+        .into_iter()
+        .flatten()
+        .reduce(f64::max)?;
+    Some(if worst > SPREAD_WARN_PCT {
+        (
+            format!(
+                "各伺服器差異 {worst:.0}%：瓶頸可能在到某些伺服器的路徑上，而不是你自己的網路。"
+            ),
+            true,
+        )
+    } else {
+        (
+            format!("各伺服器結果一致（差異 {worst:.1}%），數字可信。"),
+            false,
+        )
+    })
+}
+
 // ── App ─────────────────────────────────────────────────────
 
 pub struct App {
     rt: tokio::runtime::Runtime,
     ctx: egui::Context,
     settings: Settings,
+    show_settings: bool,
     job: Option<Job>,
     views: Vec<BackendView>,
     status: String,
@@ -209,9 +331,10 @@ impl App {
             rt,
             ctx,
             settings: Settings::default(),
+            show_settings: false,
             job: None,
             views: Vec::new(),
-            status: "選擇伺服器與測試項目，按「開始測試」。".into(),
+            status: String::new(),
             report: None,
             copied_at: None,
         })
@@ -225,11 +348,9 @@ impl App {
         let backends = self.settings.backends();
         let dirs = self.settings.directions();
         let cfg = self.settings.config();
-        self.views = backends
-            .iter()
-            .map(|&k| BackendView::new(k, dirs.clone()))
-            .collect();
+        self.views = backends.iter().map(|&k| BackendView::new(k)).collect();
         self.report = None;
+        self.show_settings = false;
         self.status = "準備中…".into();
 
         let (tx, rx) = mpsc::channel();
@@ -267,7 +388,7 @@ impl App {
             for v in &mut self.views {
                 v.active = None;
             }
-            self.status = "已停止。".into();
+            self.status = "已停止".into();
         }
     }
 
@@ -289,14 +410,14 @@ impl App {
                 }
                 Ok(Msg::Finished(rep)) => {
                     let secs = job.started.elapsed().as_secs_f64();
-                    self.status = format!("完成，共 {secs:.0} 秒。");
+                    self.status = format!("完成，共 {secs:.0} 秒");
                     self.report = Some(rep);
                     self.job = None;
                     return;
                 }
                 Err(TryRecvError::Empty) => return,
                 Err(TryRecvError::Disconnected) => {
-                    self.status = "測試意外中止。".into();
+                    self.status = "測試意外中止".into();
                     self.job = None;
                     return;
                 }
@@ -306,144 +427,208 @@ impl App {
 
     // ── 畫面 ──
 
-    fn top_bar(&mut self, ui: &mut egui::Ui) {
+    fn header(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
-            ui.heading("trueput 網路速度測試");
-            ui.add_space(16.0);
+            ui.label(RichText::new("trueput").size(22.0).strong());
+            ui.label(RichText::new("網路速度測試").size(16.0).weak());
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                let label = if self.show_settings {
+                    "收起設定"
+                } else {
+                    "設定"
+                };
+                let btn = ui.add_enabled(!self.running(), egui::Button::new(label));
+                if btn.clicked() {
+                    self.show_settings = !self.show_settings;
+                }
+            });
+        });
+    }
+
+    fn hero(&mut self, ui: &mut egui::Ui) {
+        let h = hero(&self.views);
+        ui.columns(3, |cols| {
+            for (col, dir) in cols.iter_mut().zip(DIRECTIONS) {
+                col.vertical_centered(|ui| {
+                    ui.label(
+                        RichText::new(format!("{} {}", dir_arrow(dir), dir.label()))
+                            .color(dir_color(dir))
+                            .strong(),
+                    );
+                    let (text, live) = match h.speed[dir_index(dir)] {
+                        Some((m, live)) => (format!("{m:.1}"), live),
+                        None => ("—".into(), false),
+                    };
+                    let big = RichText::new(text).size(46.0);
+                    ui.label(if live { big.weak() } else { big.strong() })
+                        .on_hover_text("測了多台伺服器時，顯示其中最高的結果");
+                    ui.weak("Mbps");
+                });
+            }
+            cols[2].vertical_centered(|ui| {
+                ui.label(RichText::new("延遲").strong());
+                let text = h.idle_ms.map_or("—".into(), fmt_ms);
+                ui.label(RichText::new(text).size(46.0).strong())
+                    .on_hover_text("閒置時的延遲（取最近的伺服器）");
+                ui.weak("ms");
+                if let (Some(inc), Some(grade)) = (h.increase_ms, h.grade) {
+                    ui.horizontal(|ui| {
+                        // 手動置中：badge + 文字
+                        let w = 150.0;
+                        ui.add_space(((ui.available_width() - w) / 2.0).max(0.0));
+                        grade_badge(ui, grade);
+                        ui.weak(format!("負載下 +{} ms", fmt_ms(inc)));
+                    });
+                }
+            });
+        });
+    }
+
+    fn start_button(&mut self, ui: &mut egui::Ui) {
+        ui.vertical_centered(|ui| {
+            let size = egui::vec2(200.0, 44.0);
             if self.running() {
-                if ui
-                    .add_sized(
-                        [110.0, 30.0],
-                        egui::Button::new(RichText::new("停止").size(16.0)),
-                    )
-                    .clicked()
-                {
+                let stop = egui::Button::new(RichText::new("停止").size(18.0)).min_size(size);
+                if ui.add(stop).clicked() {
                     self.stop();
                 }
             } else {
-                let start = ui
-                    .add_enabled(
-                        self.settings.can_start(),
-                        egui::Button::new(RichText::new("開始測試").size(16.0).strong())
-                            .fill(DOWNLOAD_COLOR.gamma_multiply(0.85))
-                            .min_size(egui::vec2(110.0, 30.0)),
-                    )
-                    .on_disabled_hover_text("至少選一台伺服器與一個測試項目");
-                if start.clicked() {
+                let label = if self.views.is_empty() {
+                    "開始測試"
+                } else {
+                    "再測一次"
+                };
+                let start = egui::Button::new(
+                    RichText::new(label)
+                        .size(18.0)
+                        .strong()
+                        .color(Color32::WHITE),
+                )
+                .fill(DOWNLOAD_COLOR)
+                .min_size(size);
+                let resp = ui
+                    .add_enabled(self.settings.can_start(), start)
+                    .on_disabled_hover_text("請在「設定」中至少選一台伺服器與一個測試項目");
+                if resp.clicked() {
                     self.start();
                 }
             }
-            ui.add_space(8.0);
-            // 不用會持續轉動的 spinner：它讓畫面每秒重畫數十次，會跟測速搶 CPU。
-            // 畫面只在收到新資料、或每 0.2 秒更新計時時才重畫。
-            if let Some(job) = &self.job {
-                ui.label(
-                    RichText::new(format!(
-                        "測試中 {:.0}s",
-                        job.started.elapsed().as_secs_f64()
-                    ))
-                    .strong(),
-                );
-            }
-            ui.label(&self.status);
-        });
-    }
-
-    fn settings_panel(&mut self, ui: &mut egui::Ui) {
-        let enabled = !self.running();
-        ui.add_enabled_ui(enabled, |ui| {
-            let s = &mut self.settings;
-            ui.add_space(4.0);
-            ui.strong("伺服器");
-            ui.checkbox(&mut s.cloudflare, "Cloudflare")
-                .on_hover_text(BackendKind::Cloudflare.description());
-            ui.checkbox(&mut s.ndt7, "M-Lab ndt7")
-                .on_hover_text(BackendKind::Ndt7.description());
-            ui.weak("勾選多台會在最後比較結果");
-
-            ui.separator();
-            ui.strong("測試項目");
-            ui.horizontal(|ui| {
-                ui.checkbox(&mut s.download, "下載");
-                ui.checkbox(&mut s.upload, "上傳");
-            });
-
-            ui.separator();
-            ui.strong("連線數");
-            ui.radio_value(&mut s.auto_connections, true, "自動調整");
-            ui.add_enabled_ui(s.auto_connections, |ui| {
-                ui.horizontal(|ui| {
-                    ui.add_space(18.0);
-                    ui.label("上限");
-                    ui.add(egui::DragValue::new(&mut s.max_connections).range(1..=64));
-                    ui.label("條");
-                });
-            });
-            ui.radio_value(&mut s.auto_connections, false, "固定");
-            ui.add_enabled_ui(!s.auto_connections, |ui| {
-                ui.horizontal(|ui| {
-                    ui.add_space(18.0);
-                    ui.add(egui::DragValue::new(&mut s.fixed_connections).range(1..=64));
-                    ui.label("條");
-                });
-            });
-            ui.weak("ndt7 依規範固定 1 條");
-
-            ui.separator();
-            ui.strong("每個方向最長");
-            ui.add(
-                egui::Slider::new(&mut s.duration_secs, 5.0..=60.0)
-                    .step_by(1.0)
-                    .suffix(" 秒"),
-            );
-            ui.checkbox(&mut s.early_stop, "結果穩定時提前結束");
-            ui.checkbox(&mut s.latency, "量測延遲（bufferbloat）");
-
-            ui.separator();
-            if ui.button("恢復預設值").clicked() {
-                *s = Settings::default();
+            let status = match &self.job {
+                Some(job) => format!(
+                    "{}  ·  {:.0}s",
+                    self.status,
+                    job.started.elapsed().as_secs_f64()
+                ),
+                None => self.status.clone(),
+            };
+            if !status.is_empty() {
+                ui.weak(status);
             }
         });
     }
 
-    fn results(&mut self, ui: &mut egui::Ui) {
+    /// 測試進行中才顯示：目前這台伺服器、這個方向的即時速度
+    fn live_chart(&self, ui: &mut egui::Ui) {
+        let Some((view, dir)) = self.views.iter().find_map(|v| v.active.map(|d| (v, d))) else {
+            return;
+        };
+        speed_plot(ui, ("live", view.kind.name()), &view.live, Some(dir), 130.0);
+    }
+
+    fn server_table(&self, ui: &mut egui::Ui) {
         if self.views.is_empty() {
-            ui.centered_and_justified(|ui| {
-                ui.label(
-                    RichText::new("選擇左邊的伺服器與測試項目，按「開始測試」。")
-                        .size(16.0)
-                        .weak(),
-                );
-            });
             return;
         }
-        egui::ScrollArea::vertical().show(ui, |ui| {
-            let running = self.running();
-            for view in &self.views {
-                backend_card(ui, view, running);
-                ui.add_space(10.0);
-            }
-            if let Some(rep) = &self.report {
-                comparison(ui, rep);
-            }
-        });
+        egui::Grid::new("servers")
+            .num_columns(5)
+            .spacing([28.0, 8.0])
+            .striped(true)
+            .show(ui, |ui| {
+                for h in ["伺服器", "下載", "上傳", "延遲", "等級"] {
+                    ui.weak(h);
+                }
+                ui.end_row();
+                for v in &self.views {
+                    let name = ui.strong(v.kind.name());
+                    if let Some(r) = &v.report {
+                        name.on_hover_text(r.server_text());
+                    }
+                    if let Some(err) = v.connect_error() {
+                        ui.label(RichText::new("無法連線").color(ERROR_COLOR))
+                            .on_hover_text(err);
+                        ui.end_row();
+                        continue;
+                    }
+                    for dir in DIRECTIONS {
+                        let done = v.report.as_ref().and_then(|r| r.mbps(dir));
+                        match (done, v.live_mbps(dir)) {
+                            (Some(m), _) => ui.label(format!("{m:.1}")),
+                            (None, Some(m)) => ui.weak(format!("{m:.1}…")),
+                            (None, None) => ui.weak("—"),
+                        };
+                    }
+                    ui.label(
+                        v.idle_ms()
+                            .map_or("—".into(), |ms| format!("{} ms", fmt_ms(ms))),
+                    );
+                    match v.worst_increase_ms() {
+                        Some(inc) => {
+                            grade_badge(ui, bufferbloat_grade(inc));
+                        }
+                        None => {
+                            ui.weak("—");
+                        }
+                    }
+                    ui.end_row();
+                }
+            });
+        if let Some((text, warn)) = self.report.as_ref().and_then(verdict) {
+            ui.add_space(4.0);
+            let t = RichText::new(text);
+            ui.label(if warn { t.color(WARN_COLOR) } else { t.weak() });
+        }
     }
 
-    fn bottom_bar(&mut self, ui: &mut egui::Ui) {
-        ui.horizontal(|ui| {
-            ui.weak("速度為應用層 goodput，不含 TCP/IP/TLS 標頭，約比線路速度低 3–6%。");
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+    fn details(&mut self, ui: &mut egui::Ui) {
+        if self.views.iter().all(|v| v.report.is_none()) {
+            return;
+        }
+        egui::CollapsingHeader::new("詳細資料")
+            .default_open(false)
+            .show(ui, |ui| {
+                for v in &self.views {
+                    let Some(r) = &v.report else { continue };
+                    ui.add_space(6.0);
+                    ui.label(
+                        RichText::new(format!("{}：{}", r.backend, r.server_text())).strong(),
+                    );
+                    if let Some(t) = r.idle_text() {
+                        ui.label(t);
+                    }
+                    for e in &r.errors {
+                        ui.label(RichText::new(e).color(ERROR_COLOR));
+                    }
+                    for dir in DIRECTIONS {
+                        if let Some(d) = r.direction(dir) {
+                            ui.label(RichText::new(d.headline()).color(dir_color(dir)));
+                            for line in d.detail_lines() {
+                                ui.label(format!("    {line}"));
+                            }
+                        }
+                    }
+                    if v.live.iter().any(|l| !l.is_empty()) {
+                        speed_plot(ui, ("detail", v.kind.name()), &v.live, None, 120.0);
+                    }
+                }
+                ui.add_space(8.0);
+                ui.weak("速度為應用層 goodput，不含 TCP/IP/TLS 標頭，約比線路速度低 3–6%。圖表淡色段為暖機，不列入結果。");
                 let copied = self
                     .copied_at
                     .is_some_and(|t| t.elapsed() < Duration::from_secs(2));
-                let label = if copied {
-                    "已複製！"
-                } else {
-                    "複製 JSON 結果"
-                };
+                let label = if copied { "已複製！" } else { "複製 JSON 結果" };
                 let btn = ui
                     .add_enabled(self.report.is_some(), egui::Button::new(label))
-                    .on_hover_text("完整結果（含所有樣本），可貼到檔案或回報問題時使用");
+                    .on_hover_text("完整結果（含所有樣本），回報問題時可以附上");
                 if btn.clicked()
                     && let Some(rep) = &self.report
                     && let Ok(json) = serde_json::to_string_pretty(rep)
@@ -452,184 +637,113 @@ impl App {
                     self.copied_at = Some(Instant::now());
                 }
             });
-        });
+    }
+
+    /// 設定：在標題下方展開，不會蓋住其他內容
+    fn settings_panel(&mut self, ui: &mut egui::Ui) {
+        egui::Frame::group(ui.style())
+            .inner_margin(12.0)
+            .corner_radius(8.0)
+            .show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                let s = &mut self.settings;
+                ui.horizontal(|ui| {
+                    ui.strong("伺服器");
+                    ui.checkbox(&mut s.cloudflare, "Cloudflare")
+                        .on_hover_text(BackendKind::Cloudflare.description());
+                    ui.checkbox(&mut s.ndt7, "M-Lab ndt7")
+                        .on_hover_text(BackendKind::Ndt7.description());
+                });
+                ui.horizontal(|ui| {
+                    ui.strong("測試項目");
+                    ui.checkbox(&mut s.download, "下載");
+                    ui.checkbox(&mut s.upload, "上傳");
+                });
+                egui::CollapsingHeader::new("進階").show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.label("連線數");
+                        ui.radio_value(&mut s.auto_connections, true, "自動，最多");
+                        ui.radio_value(&mut s.auto_connections, false, "固定");
+                        let n = if s.auto_connections {
+                            &mut s.max_connections
+                        } else {
+                            &mut s.fixed_connections
+                        };
+                        ui.add(egui::DragValue::new(n).range(1..=64).suffix(" 條"));
+                    });
+                    ui.horizontal(|ui| {
+                        ui.label("每個方向最長");
+                        ui.add(
+                            egui::Slider::new(&mut s.duration_secs, 5.0..=60.0)
+                                .step_by(1.0)
+                                .suffix(" 秒"),
+                        );
+                    });
+                    ui.checkbox(&mut s.early_stop, "結果穩定時提前結束");
+                    ui.checkbox(&mut s.latency, "量測延遲（bufferbloat）");
+                    if ui.button("恢復預設值").clicked() {
+                        *s = Settings::default();
+                    }
+                });
+            });
     }
 }
 
 impl eframe::App for App {
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.poll();
-        // 執行中每 0.2 秒更新一次計時；「已複製」的提示也要按時消失
+        // 執行中每 0.2 秒更新一次計時；「已複製」的提示也要按時消失。
+        // 不用持續的動畫：畫面只在有新資料時重畫，才不會跟測速搶 CPU。
         if self.running() || self.copied_at.is_some() {
             ctx.request_repaint_after(Duration::from_millis(200));
         }
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
-        egui::Panel::top("top")
-            .frame(egui::Frame::side_top_panel(ui.style()).inner_margin(10.0))
-            .show(ui, |ui| self.top_bar(ui));
-        egui::Panel::bottom("bottom")
-            .frame(egui::Frame::side_top_panel(ui.style()).inner_margin(8.0))
-            .show(ui, |ui| self.bottom_bar(ui));
-        egui::Panel::left("settings")
-            .resizable(false)
-            .exact_size(230.0)
-            .frame(egui::Frame::side_top_panel(ui.style()).inner_margin(12.0))
-            .show(ui, |ui| self.settings_panel(ui));
-        egui::CentralPanel::default().show(ui, |ui| self.results(ui));
-    }
-}
-
-// ── 卡片元件 ────────────────────────────────────────────────
-
-fn backend_card(ui: &mut egui::Ui, view: &BackendView, running: bool) {
-    egui::Frame::group(ui.style())
-        .inner_margin(14.0)
-        .corner_radius(8.0)
-        .show(ui, |ui| {
-            ui.set_width(ui.available_width());
-            let rep = view.report.as_ref();
-
-            ui.horizontal(|ui| {
-                ui.label(RichText::new(view.kind.name()).size(18.0).strong());
-                match rep {
-                    Some(r) => ui.label(RichText::new(r.server_text()).weak()),
-                    None => ui.label(RichText::new("等待中").weak()),
-                };
-            });
-            if let Some(t) = rep.and_then(BackendReport::idle_text) {
-                ui.label(t);
-            }
-            if let Some(r) = rep {
-                for e in &r.errors {
-                    ui.label(RichText::new(e).color(ERROR_COLOR));
-                }
-            }
-            ui.add_space(6.0);
-
-            ui.columns(2, |cols| {
-                for (col, dir) in cols.iter_mut().zip(DIRECTIONS) {
-                    direction_tile(col, view, dir, running);
-                }
-            });
-
-            if view.live.iter().any(|l| !l.is_empty()) {
-                ui.add_space(6.0);
-                speed_chart(ui, view);
-            }
-
-            if let Some(r) = rep
-                && (r.download.is_some() || r.upload.is_some())
-            {
-                egui::CollapsingHeader::new("詳細資料")
-                    .id_salt(("details", view.kind.name()))
-                    .show(ui, |ui| {
-                        for dir in DIRECTIONS {
-                            if let Some(d) = r.direction(dir) {
-                                ui.label(RichText::new(dir.label()).strong().color(dir_color(dir)));
-                                for line in d.detail_lines() {
-                                    ui.label(line);
-                                }
-                            }
+        egui::CentralPanel::default().show(ui, |ui| {
+            egui::ScrollArea::vertical().show(ui, |ui| {
+                // 內容置中，最寬 CONTENT_WIDTH
+                let width = ui.available_width().min(CONTENT_WIDTH);
+                ui.horizontal(|ui| {
+                    ui.add_space(((ui.available_width() - width) / 2.0).max(0.0));
+                    ui.vertical(|ui| {
+                        ui.set_width(width);
+                        ui.add_space(8.0);
+                        self.header(ui);
+                        if self.show_settings && !self.running() {
+                            ui.add_space(8.0);
+                            self.settings_panel(ui);
                         }
+                        ui.add_space(28.0);
+                        self.hero(ui);
+                        ui.add_space(24.0);
+                        self.start_button(ui);
+                        ui.add_space(16.0);
+                        self.live_chart(ui);
+                        ui.add_space(12.0);
+                        self.server_table(ui);
+                        ui.add_space(12.0);
+                        self.details(ui);
+                        ui.add_space(16.0);
                     });
-            }
-        });
-}
-
-/// 一個方向沒有結果、也不在進行中時的狀態文字
-pub fn pending_text(planned: bool, connected: Option<bool>, running: bool) -> &'static str {
-    match (planned, connected, running) {
-        (false, _, _) => "未選擇",
-        // 連不上伺服器，這個方向不會執行
-        (true, Some(false), _) => "未執行",
-        (true, _, true) => "等待中",
-        // 測試已結束（完成、停止或失敗），這個方向沒有結果
-        (true, _, false) => "未完成",
-    }
-}
-
-fn direction_tile(ui: &mut egui::Ui, view: &BackendView, dir: Direction, running: bool) {
-    let color = dir_color(dir);
-    ui.label(
-        RichText::new(format!("{} {}", dir_arrow(dir), dir.label()))
-            .color(color)
-            .strong(),
-    );
-
-    let done = view.report.as_ref().and_then(|r| r.direction(dir));
-    let big = |ui: &mut egui::Ui, value: String, strong: bool| {
-        ui.horizontal(|ui| {
-            let text = RichText::new(value).size(34.0);
-            ui.label(if strong { text.strong() } else { text.weak() });
-            ui.label(RichText::new("Mbps").weak());
-        });
-    };
-
-    if let Some(d) = done {
-        match &d.summary {
-            Some(s) => {
-                big(ui, format!("{:.1}", s.mbps), true);
-                ui.weak(format!(
-                    "每秒 P10–P90：{:.0} – {:.0}",
-                    s.p10_mbps, s.p90_mbps
-                ));
-            }
-            None => {
-                ui.label(RichText::new("測試太短").color(WARN_COLOR));
-            }
-        }
-        if let Some(lat) = &d.latency
-            && let (Some(l), Some(inc), Some(grade)) =
-                (&lat.loaded, lat.increase_ms, lat.bufferbloat_grade)
-        {
-            ui.horizontal(|ui| {
-                ui.label(
-                    RichText::new(format!(" {grade} "))
-                        .strong()
-                        .color(Color32::WHITE)
-                        .background_color(grade_color(grade)),
-                )
-                .on_hover_text("Bufferbloat 等級：傳輸中延遲比閒置增加越少越好");
-                ui.label(format!(
-                    "{}中延遲 {:.1} ms（+{inc:.1}）",
-                    dir.label(),
-                    l.median_ms
-                ));
+                });
             });
-        }
-        if d.early_stopped {
-            ui.weak(format!("{:.1} 秒，結果穩定提前結束", d.elapsed_secs));
-        }
-    } else if view.active == Some(dir) {
-        let last = view.live[dir_index(dir)].last();
-        big(
-            ui,
-            last.map_or("…".into(), |s| format!("{:.1}", s.mbps)),
-            false,
-        );
-        if let Some(s) = last {
-            let phase = if s.warmup { "暖機中" } else { "量測中" };
-            ui.weak(format!(
-                "{phase} {:.1}s · {} 條連線",
-                s.t_secs, s.connections
-            ));
-        }
-    } else {
-        let connected = view.report.as_ref().map(|r| r.server.is_some());
-        big(ui, "—".into(), false);
-        ui.weak(pending_text(
-            view.planned.contains(&dir),
-            connected,
-            running,
-        ));
+        });
     }
 }
 
-fn speed_chart(ui: &mut egui::Ui, view: &BackendView) {
-    Plot::new(("speed", view.kind.name()))
-        .height(170.0)
+// ── 圖表 ────────────────────────────────────────────────────
+
+/// 速度折線圖；`only` 指定時只畫那個方向（即時圖），否則下載、上傳都畫。
+fn speed_plot(
+    ui: &mut egui::Ui,
+    id: impl std::hash::Hash + std::fmt::Debug,
+    live: &[Vec<Sample>; 2],
+    only: Option<Direction>,
+    height: f32,
+) {
+    Plot::new(id)
+        .height(height)
         // 同一方向的暖機段與正式段同名、顏色不同：圖例用先畫的正式段顏色
         .legend(Legend::default().color_conflict_handling(ColorConflictHandling::PickFirst))
         .allow_drag(false)
@@ -638,11 +752,13 @@ fn speed_chart(ui: &mut egui::Ui, view: &BackendView) {
         .allow_boxed_zoom(false)
         .include_x(0.0)
         .include_y(0.0)
-        .x_axis_label("秒")
         .y_axis_label("Mbps")
         .show(ui, |plot| {
             for dir in DIRECTIONS {
-                let (warm, steady) = split_series(&view.live[dir_index(dir)]);
+                if only.is_some_and(|d| d != dir) {
+                    continue;
+                }
+                let (warm, steady) = split_series(&live[dir_index(dir)]);
                 let color = dir_color(dir);
                 // 先畫正式段（實色），再畫暖機段（淡色）
                 if !steady.is_empty() {
@@ -661,65 +777,13 @@ fn speed_chart(ui: &mut egui::Ui, view: &BackendView) {
                 }
             }
         });
-    ui.weak("淡色：暖機（慢啟動、調整連線數），不列入結果");
-}
-
-fn comparison(ui: &mut egui::Ui, rep: &Report) {
-    let Some(cmp) = &rep.comparison else { return };
-    egui::Frame::group(ui.style())
-        .inner_margin(14.0)
-        .corner_radius(8.0)
-        .show(ui, |ui| {
-            ui.set_width(ui.available_width());
-            ui.label(RichText::new("比較").size(18.0).strong());
-            let fmt = |v: Option<f64>| v.map_or("—".into(), |v| format!("{v:.1}"));
-            egui::Grid::new("comparison")
-                .striped(true)
-                .spacing([24.0, 6.0])
-                .show(ui, |ui| {
-                    for h in ["伺服器", "下載 Mbps", "上傳 Mbps", "閒置延遲 ms", "下載中 ms", "上傳中 ms"] {
-                        ui.strong(h);
-                    }
-                    ui.end_row();
-                    for r in &rep.results {
-                        let loaded = |dir| {
-                            r.direction(dir)
-                                .and_then(|d| d.latency.as_ref())
-                                .and_then(|l| l.loaded.as_ref())
-                                .map(|l| l.median_ms)
-                        };
-                        ui.label(r.backend);
-                        ui.label(fmt(r.mbps(Direction::Download)));
-                        ui.label(fmt(r.mbps(Direction::Upload)));
-                        ui.label(fmt(r.idle_latency.as_ref().map(|s| s.median_ms)));
-                        ui.label(fmt(loaded(Direction::Download)));
-                        ui.label(fmt(loaded(Direction::Upload)));
-                        ui.end_row();
-                    }
-                });
-            ui.add_space(6.0);
-            for (label, spread) in [
-                ("下載", cmp.download_spread_pct),
-                ("上傳", cmp.upload_spread_pct),
-            ] {
-                let Some(p) = spread else { continue };
-                if p > SPREAD_WARN_PCT {
-                    ui.label(
-                        RichText::new(format!(
-                            "{label}差異 {p:.1}%：超過 {SPREAD_WARN_PCT:.0}%，瓶頸可能在你到特定伺服器的路徑上，而不是你自己的網路。"
-                        ))
-                        .color(WARN_COLOR),
-                    );
-                } else {
-                    ui.label(format!("{label}差異 {p:.1}%：各伺服器結果一致。"));
-                }
-            }
-        });
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use trueput::report::{DirectionReport, Report};
+    use trueput::stats::{LatencySummary, RttStats, Summary};
 
     fn sample(t: f64, mbps: f64, warmup: bool) -> Sample {
         Sample {
@@ -728,6 +792,70 @@ mod tests {
             warmup,
             connections: 1,
             latest_rtt_ms: None,
+        }
+    }
+
+    fn rtt(ms: f64) -> RttStats {
+        RttStats {
+            median_ms: ms,
+            min_ms: ms,
+            p90_ms: ms,
+            jitter_ms: 0.0,
+            count: 10,
+            lost: 0,
+        }
+    }
+
+    /// 組出一份測完的報告
+    fn finished(name: &'static str, down: f64, up: f64, idle: f64, inc: [f64; 2]) -> BackendView {
+        let dir = |direction: Direction, mbps: f64, inc: f64| DirectionReport {
+            backend: name,
+            direction,
+            connection_mode: "auto",
+            connections: 4,
+            connection_limit: None,
+            connection_steps: vec![],
+            scale_window_secs: Some(1.0),
+            warmup_secs: Some(3.0),
+            elapsed_secs: 8.0,
+            early_stopped: true,
+            total_bytes: 1,
+            summary: Some(Summary {
+                mbps,
+                median_mbps: mbps,
+                p10_mbps: mbps,
+                p90_mbps: mbps,
+                max_mbps: mbps,
+                samples: 10,
+            }),
+            latency: Some(LatencySummary {
+                idle: Some(rtt(idle)),
+                loaded: Some(rtt(idle + inc)),
+                increase_ms: Some(inc),
+                bufferbloat_grade: Some(bufferbloat_grade(inc)),
+            }),
+            server_side: None,
+            samples: vec![],
+            loaded_probes: vec![],
+            stream_errors: vec![],
+        };
+        let mut r = BackendReport::new(name);
+        r.server = Some(trueput::backend::ServerInfo {
+            name: format!("{name}.example"),
+            location: None,
+        });
+        r.idle_latency = Some(rtt(idle));
+        r.download = Some(dir(Direction::Download, down, inc[0]));
+        r.upload = Some(dir(Direction::Upload, up, inc[1]));
+        BackendView {
+            kind: if name == "ndt7" {
+                BackendKind::Ndt7
+            } else {
+                BackendKind::Cloudflare
+            },
+            report: Some(r),
+            live: [Vec::new(), Vec::new()],
+            active: None,
         }
     }
 
@@ -799,13 +927,76 @@ mod tests {
     }
 
     #[test]
-    fn pending_states() {
-        assert_eq!(pending_text(false, None, true), "未選擇");
-        assert_eq!(pending_text(true, None, true), "等待中");
-        assert_eq!(pending_text(true, Some(true), true), "等待中");
-        assert_eq!(pending_text(true, Some(false), true), "未執行");
-        assert_eq!(pending_text(true, Some(false), false), "未執行");
-        assert_eq!(pending_text(true, Some(true), false), "未完成");
-        assert_eq!(pending_text(true, None, false), "未完成");
+    fn hero_takes_best_speed_and_nearest_server_latency() {
+        let views = [
+            // Cloudflare 比較近（6.7 ms），上傳時延遲增加較多
+            finished("cloudflare", 91.8, 94.7, 6.7, [24.0, 35.0]),
+            finished("ndt7", 92.5, 93.2, 15.6, [24.0, 24.0]),
+        ];
+        let h = hero(&views);
+        assert_eq!(h.speed, [Some((92.5, false)), Some((94.7, false))]);
+        assert_eq!(h.idle_ms, Some(6.7));
+        assert_eq!(h.increase_ms, Some(35.0), "取最近伺服器最差的方向");
+        assert_eq!(h.grade, Some("B"));
+    }
+
+    #[test]
+    fn hero_shows_live_value_while_testing() {
+        let mut testing = BackendView::new(BackendKind::Ndt7);
+        testing.active = Some(Direction::Upload);
+        testing.live[1].push(sample(1.0, 50.0, true));
+        let views = [finished("cloudflare", 91.8, 94.7, 6.7, [5.0, 5.0]), testing];
+        let h = hero(&views);
+        assert_eq!(h.speed[0], Some((91.8, false)));
+        assert_eq!(h.speed[1], Some((50.0, true)), "正在測的方向顯示即時值");
+        assert_eq!(hero(&[]), Hero::default());
+    }
+
+    #[test]
+    fn connect_error_only_when_prepare_failed() {
+        let mut failed = BackendView::new(BackendKind::Ndt7);
+        let mut r = BackendReport::new("ndt7");
+        r.errors.push("準備測試失敗：timeout".into());
+        failed.report = Some(r);
+        assert_eq!(failed.connect_error(), Some("準備測試失敗：timeout"));
+        assert_eq!(
+            finished("cloudflare", 1.0, 1.0, 1.0, [0.0, 0.0]).connect_error(),
+            None
+        );
+        assert_eq!(BackendView::new(BackendKind::Ndt7).connect_error(), None);
+    }
+
+    #[test]
+    fn verdict_text() {
+        let views = [
+            finished("cloudflare", 91.8, 94.7, 6.7, [5.0, 5.0]),
+            finished("ndt7", 90.9, 93.2, 15.6, [5.0, 5.0]),
+        ];
+        let rep = Report::new(views.into_iter().map(|v| v.report.unwrap()).collect());
+        let (text, warn) = verdict(&rep).unwrap();
+        assert!(!warn && text.contains("一致"), "{text}");
+
+        let views = [
+            finished("cloudflare", 100.0, 50.0, 6.7, [5.0, 5.0]),
+            finished("ndt7", 70.0, 50.0, 15.6, [5.0, 5.0]),
+        ];
+        let rep = Report::new(views.into_iter().map(|v| v.report.unwrap()).collect());
+        let (text, warn) = verdict(&rep).unwrap();
+        assert!(warn && text.contains("30%"), "{text}");
+
+        let single = Report::new(vec![
+            finished("cloudflare", 1.0, 1.0, 1.0, [0.0, 0.0])
+                .report
+                .unwrap(),
+        ]);
+        assert!(verdict(&single).is_none());
+    }
+
+    #[test]
+    fn ms_formatting() {
+        assert_eq!(fmt_ms(0.34), "0.3");
+        assert_eq!(fmt_ms(6.7), "6.7");
+        assert_eq!(fmt_ms(15.6), "16");
+        assert_eq!(fmt_ms(123.4), "123");
     }
 }

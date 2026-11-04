@@ -1,9 +1,33 @@
 # trueput
 
 輕量、方法透明的網路速度測試工具，用 Rust 撰寫。測下載、上傳，以及負載下延遲（bufferbloat）。
-單一執行檔約 2.5 MB。
+有視窗版與命令列版，兩者用同一套測速引擎，結果完全一致。
 
-## 使用
+## 視窗版
+
+```bash
+cargo run --release --bin trueput-gui
+```
+
+按「開始測試」即可。上方三個大數字是下載、上傳與延遲；下方表格每台伺服器一列，並告訴你各伺服器結果是否一致。
+伺服器與測試項目在「設定」，P10–P90、連線數、伺服器端對照、圖表與 JSON 匯出在「詳細資料」。
+
+### 打包成 exe（Windows）
+
+```bash
+cargo build --release
+```
+
+產生 `target\release\trueput-gui.exe`（約 9 MB），可直接複製到任何 Windows 電腦執行：
+
+- 不會跳出主控台視窗；
+- 靜態連結 C runtime（`.cargo/config.toml`），不需要安裝 Visual C++ 可轉散發套件；
+- 圖示與版本資訊在編譯時嵌入（`build.rs`，需要 Visual Studio Build Tools 附的 Windows SDK；沒有的話只會少了 exe 圖示）；
+- 中文字型使用系統內建的微軟正黑體，不打包字型。
+
+只要命令列版（較小、編譯較快）：`cargo build --release --no-default-features`。
+
+## 命令列版
 
 ```bash
 cargo build --release
@@ -97,8 +121,17 @@ ndt7 伺服器會定期回報核心的 TCPInfo。我們用它來對照客戶端�
 ## 專案結構
 
 ```
+build.rs               Windows：把圖示與版本資訊嵌進 exe
 src/
-├── main.rs            CLI 參數與流程（多後端、雙向）
+├── lib.rs             函式庫：命令列版與視窗版共用
+├── main.rs            命令列版
+├── runner.rs          對一台伺服器跑完整測試，以回呼回報進度
+├── gui/
+│   ├── main.rs        視窗版進入點（Windows 不顯示主控台）
+│   ├── app.rs         畫面
+│   ├── fonts.rs       中文字型（微軟正黑體等系統字型）
+│   ├── icon.rs        視窗圖示
+│   └── icon_pixels.rs 圖示繪製與 .ico 編碼（視窗與 exe 共用）
 ├── engine.rs          測速引擎：平行連線、取樣、暖機、提前結束、伺服器端對照
 ├── autoscale.rs       動態調整連線數、依 RTT 決定評估窗格
 ├── latency.rs         延遲量測（TCP 交握）

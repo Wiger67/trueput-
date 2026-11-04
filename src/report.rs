@@ -37,7 +37,7 @@ pub struct BackendReport {
 pub struct DirectionReport {
     /// 後端名稱（只用於顯示）
     #[serde(skip)]
-    backend: &'static str,
+    pub backend: &'static str,
     pub direction: Direction,
     /// "auto" 或 "fixed"
     pub connection_mode: &'static str,

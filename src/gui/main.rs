@@ -15,8 +15,8 @@ fn main() -> eframe::Result {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("trueput 網路速度測試")
-            .with_inner_size([1040.0, 760.0])
-            .with_min_inner_size([760.0, 540.0])
+            .with_inner_size([760.0, 720.0])
+            .with_min_inner_size([560.0, 520.0])
             .with_icon(icon::app_icon()),
         ..Default::default()
     };
